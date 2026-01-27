@@ -39,14 +39,20 @@ jobs:
             -L/mingw64/lib \
             -lSDL3 -lm
 
+      - name: Bundle SDL3.dll
+        run: |
+          cp /mingw64/bin/SDL3.dll .
+      
       - name: Upload artifact (for debugging)
         uses: actions/upload-artifact@v4
         with:
-          name: vtt-exe
-          path: vtt.exe
+          name: vtt-windows-x64
+          path: |
+            vtt.exe
+            SDL3.dll
       
       - name: Zip the executable
-        run: 7z a vtt-windows-x64.zip vtt.exe
+        run: zip a vtt-windows-x64.zip vtt.exe SDL3.dll
       
       - name: Create GitHub Release + attach EXE
         uses: softprops/action-gh-release@v2
