@@ -20,7 +20,7 @@ A dual-window virtual tabletop application for managing game maps, tokens, fog o
 - SDL3 library
 - GCC compiler
 - TrueType font file (font.ttf)
-- maps/ Folder in the directory of the Executable. It loads all Maps in that folder on startup. 
+- assets/maps/ Folder in the directory of the Executable. It loads all Maps (JPEG or PNG) in that folder on startup. 
 ## Building
 
 ### Windows (MSYS2/MinGW)
