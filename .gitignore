@@ -1,0 +1,32 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+
+# Build artifacts
+*.o
+*.obj
+
+# Logs and temporary files
+*.log
+*.txt
+build_output.txt
+compile_output.txt
+nul
+
+# Save files
+saves/
+.claude/
+
+# IDE/Editor files
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
