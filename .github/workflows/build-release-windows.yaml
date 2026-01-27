@@ -6,6 +6,9 @@ on:
       - "v*.*.*"     # Triggers on tags like v1.0.0, v0.5.3, etc.
       # You can also add: - "v*"   to trigger on any v...
 
+permissions:
+  contents: write
+  
 jobs:
   build-and-release:
     runs-on: windows-latest
