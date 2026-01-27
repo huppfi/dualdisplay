@@ -1,0 +1,57 @@
+name: Build Windows EXE and Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"     # Triggers on tags like v1.0.0, v0.5.3, etc.
+      # You can also add: - "v*"   to trigger on any v...
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 + MinGW64 environment
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-SDL3
+
+      - name: Build vtt.exe
+        run: |
+          # Create directories (same as your bat)
+          mkdir -p assets/maps assets/tokens saves
+
+          # Compile (adapted from your build.bat)
+          gcc -Wall -Wextra -O2 -std=c11 main.c -o vtt.exe \
+            -I/mingw64/include/SDL3 \
+            -L/mingw64/lib \
+            -lSDL3 -lm
+
+      - name: Upload artifact (for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vtt-exe
+          path: vtt.exe
+
+      - name: Create GitHub Release + attach EXE
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vtt.exe
+          draft: false                # change to true → review before publishing
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
