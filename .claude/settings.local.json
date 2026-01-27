@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebSearch",
-      "Bash(chmod:*)",
-      "Bash(pkg-config:*)"
-    ]
-  }
-}
