@@ -44,11 +44,14 @@ jobs:
         with:
           name: vtt-exe
           path: vtt.exe
-
+      
+      - name: Zip the executable
+        run: 7z a vtt-windows-x64.zip vtt.exe
+      
       - name: Create GitHub Release + attach EXE
         uses: softprops/action-gh-release@v2
         with:
-          files: vtt.exe
+          files: vtt-windows-x64.zip
           draft: false                # change to true → review before publishing
           prerelease: false
           generate_release_notes: true
