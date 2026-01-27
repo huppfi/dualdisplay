@@ -27,6 +27,7 @@ jobs:
             git
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-sdl3
+            zip
 
       - name: Build vtt.exe
         run: |
