@@ -53,7 +53,7 @@ jobs:
             SDL3.dll
       
       - name: Zip the executable
-        run: zip a vtt-windows-x64.zip vtt.exe SDL3.dll
+        run: zip vtt-windows-x64.zip vtt.exe SDL3.dll
       
       - name: Create GitHub Release + attach EXE
         uses: softprops/action-gh-release@v2
