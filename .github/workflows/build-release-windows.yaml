@@ -86,8 +86,8 @@ jobs:
             echo "Note: font.ttf not included (will use system fonts)"
           fi
           
-          echo "Release package created with:"
-          unzip -l vtt-windows-x64.zip
+          echo "Release package created:"
+          ls -lh vtt-windows-x64.zip
       
       - name: Create GitHub Release + attach EXE
         uses: softprops/action-gh-release@v2
