@@ -6,10 +6,10 @@ A dual-window virtual tabletop application for managing game maps, tokens, fog o
 
 ## Features
 
-### 🎮 Dual Window Display
+### Dual Window Display
 Separate DM and player views with synchronized or independent camera controls.
 
-### 🗺️ Map & Token Management
+### Map & Token Management
 - Drag and drop support for tokens
 - Multiple maps with quick switching (M key)
 - Token resizing and repositioning
@@ -17,32 +17,32 @@ Separate DM and player views with synchronized or independent camera controls.
 
 ![Token Management](docs/images/token-management.gif)
 
-### 🌫️ Fog of War System
+### Fog of War System
 Paint and reveal fog of war with intuitive brush controls. Players only see revealed areas.
 
 ![Fog of War](docs/images/fog-of-war.gif)
 
-### 💔 Damage Tracking
-Quick damage application with visual indicators. Supports single digit (1-9), batch (0 for 10), and custom amounts.
+###  Damage Tracking
+Quick damage application with visual indicators. Supports single digit (1-9), batch (0 for 10), and pressing Enter allows custom amounts.
 
 ![Damage Tracking](docs/images/damage-tracking.gif)
 
-### 🎯 Status Condition System
+### Status Condition System
 8 built-in conditions with color-coded visual indicators:
 - **Bleeding** (Red) • **Dazed** (Gold) • **Frightened** (Purple) • **Grabbed** (Orange)
 - **Restrained** (Brown) • **Slowed** (Blue) • **Taunted** (Pink) • **Weakened** (Green)
 
 ![Condition Wheel](docs/images/condition-wheel.gif)
 
-### 🎨 Squad Assignment & Drawing Tools
-Group tokens with color-coded borders. Draw tactical markers (rectangles/circles) for planning.
+### Squad Assignment & Drawing Tools
+Group tokens with color-coded borders.
 
 ![Squad and Drawing](docs/images/squad-drawing.gif)
 
-### 💾 Save/Load System
+### Save/Load System
 Portable .vtt save files with embedded assets
 
-### 📐 Grid Calibration
+### Grid Calibration
 Align the grid to any map size with visual calibration tool.
 
 ![Grid Calibration](docs/images/grid-calibration.gif)
