@@ -1,7 +1,3 @@
-// ============================================================================
-// INCLUDES AND CONSTANTS
-// ============================================================================
-
 #include <SDL3/SDL.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -11,7 +7,6 @@
 #include <dirent.h>
 #include <strings.h>
 #include <math.h>
-
 #ifdef _WIN32
 #include <direct.h>
 #define getcwd _getcwd
@@ -19,3630 +14,1320 @@
 #include <unistd.h>
 #endif
 
-// stb_image.h - single-header image loader supporting:
-// JPEG, PNG, BMP, TGA, PSD, GIF, HDR, PIC, PNM
-#define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-
-// stb_truetype.h - TrueType font rendering
-#define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
+#include "stb_image_write.h"
+extern unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, int stride_bytes, int x, int y, int n, int *out_len);
 
-#define DEFAULT_GRID_SIZE 64
-#define MAX_TOKENS 100
-#define MAX_SAVE_SLOTS 12
-#define WINDOW_DM_WIDTH 1280
-#define WINDOW_DM_HEIGHT 720
-#define WINDOW_PLAYER_WIDTH 1280
-#define WINDOW_PLAYER_HEIGHT 720
+#define ARRAY_COUNT(x) (sizeof(x)/sizeof((x)[0]))
+#define MAX_ASSETS 256
+#define MAX_TOKENS 256
+#define MAX_DRAWINGS 256
+#define SAVE_MAGIC 0x56545402  // Version 2 with embedded assets
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-// ============================================================================
-// CAMERA & ZOOM CONSTANTS
-// ============================================================================
-
-#define ZOOM_MIN 0.25f
-#define ZOOM_MAX 4.0f
-#define ZOOM_SPEED 0.1f
-#define CAMERA_SPEED 10
-#define CAMERA_SMOOTHING 0.15f
-
-// ============================================================================
-// DATA STRUCTURES
-// ============================================================================
-
+typedef enum { TOOL_SELECT, TOOL_FOG, TOOL_SQUAD, TOOL_DRAW } Tool;
+typedef enum { SHAPE_RECT, SHAPE_CIRCLE } Shape;
 typedef enum {
-    CONDITION_BLEEDING = 0,
-    CONDITION_DAZED,
-    CONDITION_FRIGHTENED,
-    CONDITION_GRABBED,
-    CONDITION_RESTRAINED,
-    CONDITION_SLOWED,
-    CONDITION_TAUNTED,
-    CONDITION_WEAKEND,
-    CONDITION_COUNT
-} ConditionType;
+    COND_BLEED, COND_DAZED, COND_FRIGHT, COND_GRABBED,
+    COND_RESTRAINED, COND_SLOWED, COND_TAUNTED, COND_WEAK, COND_COUNT
+} Condition;
 
 typedef struct {
-    const char *name;
-    uint8_t r, g, b;  // Color for display
-} ConditionInfo;
-
-static const ConditionInfo CONDITION_INFO[CONDITION_COUNT] = {
-    {"Bleeding", 220, 20, 20},      // Bright Red
-    {"Dazed", 255, 215, 0},         // Gold/Yellow
-    {"Frightened", 147, 51, 234},   // Purple
-    {"Grabbed", 255, 140, 0},       // Dark Orange
-    {"Restrained", 139, 69, 19},    // Saddle Brown
-    {"Slowed", 30, 144, 255},       // Dodger Blue
-    {"Taunted", 255, 20, 147},      // Deep Pink
-    {"Weakend", 50, 205, 50}        // Lime Green
-};
-
-typedef enum {
-    WINDOW_TYPE_DM,
-    WINDOW_TYPE_PLAYER
-} WindowType;
-
-typedef struct {
-    SDL_Window *window;
-    SDL_Renderer *renderer;
+    SDL_Window *win;
+    SDL_Renderer *ren;
     SDL_WindowID id;
-    WindowType type;
-    bool is_open;
-} WindowState;
+    int w, h;
+} Window;
 
 typedef struct {
-    WindowState dm_window;
-    WindowState player_window;
-} WindowManager;
+    char path[256];
+    SDL_Texture *tex[2];
+    int w, h;
+    bool loaded;
+} Asset;
 
 typedef struct {
-    SDL_Texture *dm_texture;
-    SDL_Texture *player_texture;
-    int width;
-    int height;
-    int grid_cols;
-    int grid_rows;
-    int grid_size;           // Variable grid size (calibrated or default)
-    int grid_offset_x;       // Grid offset for alignment (calibrated)
-    int grid_offset_y;       // Grid offset for alignment (calibrated)
-    char filepath[256];
-    char name[64];           // Display name extracted from filename
-} Map;
-
-typedef struct {
-    SDL_Texture *dm_texture;
-    SDL_Texture *player_texture;
-    int grid_x;
-    int grid_y;
-    int width;
-    int height;
-    int grid_size;  // Number of grid cells wide (1 for 1x1, 2 for 2x2, etc.)
-    bool selected;
-    bool hidden;     // If true, token is hidden from player view
-    int damage;      // Amount of damage taken
-    int squad;       // Squad/group index (-1 = no squad, 0-7 = squad color)
-    uint8_t opacity; // Opacity (255 = fully opaque, 128 = semi-transparent for "dead" tokens)
-    bool conditions[CONDITION_COUNT];  // Active conditions
-    char name[64];
-    char filepath[256];
-    
-    // Cached damage number rendering (performance optimization)
-    SDL_Texture *damage_texture_dm;
-    SDL_Texture *damage_texture_player;
-    int cached_damage_dm;      // Track cached damage for DM view
-    int cached_damage_player;  // Track cached damage for player view
-    float damage_tex_width;
-    float damage_tex_height;
+    int grid_x, grid_y, size, image_idx, damage, squad;
+    uint8_t opacity;
+    bool hidden, selected, cond[COND_COUNT];
+    SDL_Texture *damage_tex[2];
+    int cached_dmg[2];
 } Token;
 
 typedef struct {
-    Token tokens[MAX_TOKENS];
-    int count;
-} TokenManager;
-
-typedef struct {
-    bool **cells;
-    int cols;
-    int rows;
-} FogOfWar;
-
-typedef enum {
-    TOOL_SELECT,
-    TOOL_FOG,
-    TOOL_SQUAD,
-    TOOL_DRAW
-} EditorTool;
-
-
-
-#define SQUAD_COLOR_COUNT 8
-typedef struct {
-    uint8_t r, g, b;
-    const char *name;
-} SquadColor;
-
-static const SquadColor SQUAD_COLORS[SQUAD_COLOR_COUNT] = {
-    {255, 50, 50, "Red"},      // 0
-    {50, 150, 255, "Blue"},    // 1
-    {50, 255, 50, "Green"},    // 2
-    {255, 255, 50, "Yellow"},  // 3
-    {255, 150, 50, "Orange"},  // 4
-    {200, 50, 255, "Purple"},  // 5
-    {50, 255, 255, "Cyan"},    // 6
-    {255, 255, 255, "White"}   // 7
-};
-
-// Drawing shapes
-#define MAX_DRAWINGS 100
-typedef enum {
-    SHAPE_RECTANGLE,
-    SHAPE_CIRCLE
-} ShapeType;
-
-typedef struct {
-    ShapeType type;
-    int x1, y1;  // Start position (world coordinates)
-    int x2, y2;  // End position (world coordinates)
-    int color_index;
-    bool filled;
-    SDL_Texture *cached_texture_dm;      // Cached rendering (DM view)
-    SDL_Texture *cached_texture_player;  // Cached rendering (player view)
-    int cached_width, cached_height;
+    Shape type;
+    int x1, y1, x2, y2;
+    int color;
 } Drawing;
 
 typedef struct {
-    Drawing drawings[MAX_DRAWINGS];
-    int count;
-} DrawingManager;
-
-typedef struct {
-    EditorTool current_tool;
-    int mouse_x;
-    int mouse_y;
-    bool mouse_left_down;
-    bool mouse_right_down;
-    int last_mouse_x;
-    int last_mouse_y;
-    bool dragging_token;
-    int dragged_token_index;
-    bool painting_fog;       // Currently painting fog of war
-    bool fog_paint_mode;     // True = add fog, False = remove fog
-    bool shift_pressed;
-    bool ctrl_pressed;
-    bool show_grid;          // Grid visibility toggle
-    bool damage_input_mode;  // Currently entering damage value
-    char damage_input_buffer[16];  // Buffer for damage input
-    int damage_input_len;    // Length of current input
-    int current_squad;       // Current squad color index (0-7)
-    bool drawing_shape;      // Currently drawing a shape
-    ShapeType current_shape; // Current shape type (rectangle or circle)
-    int draw_start_x, draw_start_y;  // Drawing start position (world coords)
-    bool condition_wheel_open;  // Condition selection wheel is open
-    int condition_wheel_token_index;  // Which token the wheel is for
-} InputState;
-
-typedef struct {
-    uint32_t magic;
-    char map_path[256];
-    uint32_t token_count;
-    uint32_t fog_cols;
-    uint32_t fog_rows;
-    uint32_t grid_size;      // Save calibrated grid size
-    uint32_t grid_offset_x;  // Save calibrated grid offset
-    uint32_t grid_offset_y;  // Save calibrated grid offset
-    uint8_t show_grid;       // Save grid visibility state
-    float camera_x;          // Save DM camera position
-    float camera_y;
-    float camera_zoom;
-} SaveFileHeader;
-
-// Asset library for maps
-typedef struct {
-    char filepaths[100][512];
-    int count;
-    int current_index;
-} MapLibrary;
-
-// Cached map data for fast loading
-typedef struct {
-    char filepath[256];
-    unsigned char *pixel_data;  // Raw RGBA pixel data
-    int width;
-    int height;
-    bool loaded;
-} CachedMap;
-
-typedef struct {
-    CachedMap maps[100];
-    int count;
-    bool initialized;
-} MapCache;
-
-// Asset library for tokens
-typedef struct {
-    char filepaths[100][512];
-    int count;
-    int current_index;
-} TokenLibrary;
-
-// Grid calibration state
-typedef struct {
-    bool active;
-    bool dragging;
-    int start_x, start_y;
-    int end_x, end_y;
-    int cells_wide;          // Number of cells in rectangle (for multi-cell calibration)
-    int cells_tall;          // Number of cells in rectangle (for multi-cell calibration)
-    int calibrated_size;     // 0 = not calibrated, use default
-    int calibrated_offset_x; // Grid offset from calibration
-    int calibrated_offset_y; // Grid offset from calibration
-} GridCalibration;
-
-// ============================================================================
-// CAMERA SYSTEM
-// ============================================================================
-
-typedef struct {
-    float x, y;           // Current smoothed position
-    float target_x, target_y;  // Target position (for smoothing)
-    float zoom;
-    float target_zoom;
-    int view_width, view_height;
+    float x, y, target_x, target_y, zoom, target_zoom;
 } Camera;
 
-// ============================================================================
-// GLOBAL STATE
-// ============================================================================
-WindowManager g_wm;
-Map g_map;
-TokenManager g_tokens;
-FogOfWar g_fog;
-InputState g_input;
-MapLibrary g_map_library;
-TokenLibrary g_token_library;
-GridCalibration g_grid_calibration;
-MapCache g_map_cache;
-Camera g_dm_camera;
-Camera g_player_camera;
-bool g_sync_views = true;
-DrawingManager g_drawings;
-
-// Font rendering globals
-stbtt_fontinfo g_font;
-unsigned char *g_font_buffer = NULL;
-bool g_font_loaded = false;
-
-// UI texture cache (performance optimization)
 typedef struct {
-    SDL_Texture *texture;
-    char cached_text[256];
-    int cached_value;  // For tracking state changes
-    float width;
-    float height;
-} UITextureCache;
+    SDL_Texture *tex;
+    char text[64];
+    int w, h;
+} CachedText;
 
-UITextureCache g_damage_input_cache = {NULL, "", -1, 0, 0};
-UITextureCache g_squad_mode_cache = {NULL, "", -1, 0, 0};
+static struct {
+    Window dm, player;
+    Asset map_assets[MAX_ASSETS];
+    int map_count, map_current;
+    Asset token_lib[MAX_ASSETS];
+    int token_lib_count;
+    
+    Token tokens[MAX_TOKENS];
+    int token_count;
+    Drawing drawings[MAX_DRAWINGS];
+    int drawing_count;
+    
+    bool *fog;
+    int fog_w, fog_h, grid_size, grid_off_x, grid_off_y;
+    int map_w, map_h;
+    
+    Camera cam[2];
+    bool sync_views;
+    bool show_grid;
+    Tool tool;
+    int current_squad, current_shape;
+    
+    bool drag_token, paint_fog, fog_mode, draw_shape, shift, ctrl;
+    int drag_idx, paint_start_x, paint_start_y;
+    float last_mx, last_my;
+    
+    bool cal_active, cal_drag;
+    int cal_x1, cal_y1, cal_x2, cal_y2, cal_cells_w, cal_cells_h;
+    
+    bool cond_wheel;
+    int cond_token_idx;
+    bool dmg_input;
+    char dmg_buf[16];
+    int dmg_len;
+    
+    stbtt_fontinfo font;
+    unsigned char *font_data;
+    SDL_Texture *cond_tex[2][COND_COUNT];  // 2-letter abbreviations for tokens [view][cond]
+    SDL_Texture *cond_wheel_tex[COND_COUNT];  // Full names for wheel
+    int cond_w, cond_h;
+    
+    CachedText ui_tool, ui_squad, ui_dmg, ui_help;
+    Tool cached_tool;
+} g;
 
-// Condition wheel text cache (one per condition, shared since wheel only in DM view)
-UITextureCache g_condition_wheel_text_cache[CONDITION_COUNT];
-bool g_condition_wheel_cache_initialized = false;
-
-// ============================================================================
-// FILE UTILITIES
-// ============================================================================
-
-bool is_image_file(const char *filename) {
-    const char *ext = strrchr(filename, '.');
-    if (!ext) return false;
-    return (strcasecmp(ext, ".png") == 0 ||
-            strcasecmp(ext, ".jpg") == 0 ||
-            strcasecmp(ext, ".jpeg") == 0 ||
-            strcasecmp(ext, ".bmp") == 0 ||
-            strcasecmp(ext, ".tga") == 0);
+static bool is_image(const char *f) {
+    const char *e = strrchr(f, '.');
+    if (!e) return false;
+    return !strcasecmp(e, ".png") || !strcasecmp(e, ".jpg") || 
+           !strcasecmp(e, ".jpeg") || !strcasecmp(e, ".bmp");
 }
 
-void extract_filename(const char *filepath, char *name, size_t name_size) {
-    const char *basename = strrchr(filepath, '/');
-    if (!basename) basename = strrchr(filepath, '\\');
-    if (!basename) basename = filepath;
-    else basename++;
-    
-    strncpy(name, basename, name_size - 1);
-    name[name_size - 1] = '\0';
-    char *ext = strrchr(name, '.');
-    if (ext) *ext = '\0';
-}
-
-void normalize_path_slashes(char *path) {
-    for (int i = 0; path[i] != '\0'; i++) {
-        if (path[i] == '\\') {
-            path[i] = '/';
-        }
+static void scan_assets(const char *dir, Asset *arr, int *count) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && *count < MAX_ASSETS) {
+        if (!is_image(e->d_name)) continue;
+        int len = snprintf(arr[*count].path, 256, "%s/%s", dir, e->d_name);
+        if (len >= 256) continue;
+        (*count)++;
     }
-}
-
-void make_path_relative(char *path, size_t path_size) {
-    (void)path_size;
-    
-    // Get current working directory
-    char cwd[1024];
-    if (!getcwd(cwd, sizeof(cwd))) {
-        return;
-    }
-    
-    // Normalize slashes in cwd
-    for (int i = 0; cwd[i] != '\0'; i++) {
-        if (cwd[i] == '\\') cwd[i] = '/';
-    }
-    
-    // Normalize slashes in path
-    for (int i = 0; path[i] != '\0'; i++) {
-        if (path[i] == '\\') path[i] = '/';
-    }
-    
-    size_t cwd_len = strlen(cwd);
-    
-    // Check if path starts with cwd
-    if (strncasecmp(path, cwd, cwd_len) == 0) {
-        // Skip the cwd and any following slash
-        size_t offset = cwd_len;
-        if (path[offset] == '/' || path[offset] == '\\') {
-            offset++;
-        }
-        memmove(path, path + offset, strlen(path) - offset + 1);
-    }
-}
-
-int compare_strings(const void *a, const void *b) {
-    return strcmp((const char*)a, (const char*)b);
-}
-
-void scan_directory(const char *dir_path, char filepaths[][512], int *count, int max_count) {
-    DIR *dir = opendir(dir_path);
-    if (!dir) {
-    //         SDL_Log("Failed to open directory: %s", dir_path);
-        *count = 0;
-        return;
-    }
-    
-    struct dirent *entry;
-    *count = 0;
-    
-    while ((entry = readdir(dir)) != NULL && *count < max_count) {
-        if (is_image_file(entry->d_name)) {
-            snprintf(filepaths[*count], 512, "%s/%s", dir_path, entry->d_name);
-            (*count)++;
-        }
-    }
-    closedir(dir);
-    
-    // Sort alphabetically
-    if (*count > 0) {
-        qsort(filepaths, *count, 512, compare_strings);
-    }
-    
-    //     SDL_Log("Found %d images in %s", *count, dir_path);
-}
-
-// ============================================================================
-// TEXT RENDERING (Using TrueType font with caching)
-// ============================================================================
-
-bool font_load(const char *filepath) {
-    FILE *f = fopen(filepath, "rb");
-    if (!f) {
-    //         SDL_Log("Failed to open font file: %s", filepath);
-        return false;
-    }
-    
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    g_font_buffer = (unsigned char*)malloc(size);
-    if (!g_font_buffer) {
-        fclose(f);
-    //         SDL_Log("Failed to allocate font buffer");
-        return false;
-    }
-    
-    fread(g_font_buffer, 1, size, f);
-    fclose(f);
-    
-    if (!stbtt_InitFont(&g_font, g_font_buffer, stbtt_GetFontOffsetForIndex(g_font_buffer, 0))) {
-    //         SDL_Log("Failed to initialize font");
-        free(g_font_buffer);
-        g_font_buffer = NULL;
-        return false;
-    }
-    
-    g_font_loaded = true;
-    //     SDL_Log("Font loaded successfully");
-    return true;
-}
-
-void font_cleanup() {
-    if (g_font_buffer) {
-        free(g_font_buffer);
-        g_font_buffer = NULL;
-    }
-    
-    // Clean up UI texture caches
-    if (g_damage_input_cache.texture) {
-        SDL_DestroyTexture(g_damage_input_cache.texture);
-        g_damage_input_cache.texture = NULL;
-    }
-    if (g_squad_mode_cache.texture) {
-        SDL_DestroyTexture(g_squad_mode_cache.texture);
-        g_squad_mode_cache.texture = NULL;
-    }
-    
-    // Clean up condition wheel text cache
-    for (int i = 0; i < CONDITION_COUNT; i++) {
-        if (g_condition_wheel_text_cache[i].texture) {
-            SDL_DestroyTexture(g_condition_wheel_text_cache[i].texture);
-            g_condition_wheel_text_cache[i].texture = NULL;
-        }
-    }
-    g_condition_wheel_cache_initialized = false;
-    
-    g_font_loaded = false;
-}
-
-// Helper: Create a damage number texture (cached for performance)
-SDL_Texture* create_damage_texture(SDL_Renderer *renderer, int damage, float *out_width, float *out_height) {
-    if (damage <= 0 || !g_font_loaded) return NULL;
-    
-    char text[16];
-    snprintf(text, sizeof(text), "%d", damage);
-    
-    // Fixed font size for damage numbers (scale applied at render time)
-    float font_size = 20.0f;
-    float stb_scale = stbtt_ScaleForPixelHeight(&g_font, font_size);
-    
-    // Calculate text dimensions
-    int ascent, descent, line_gap;
-    stbtt_GetFontVMetrics(&g_font, &ascent, &descent, &line_gap);
-    
-    float text_width = 0;
-    for (int i = 0; text[i]; i++) {
-        int advance, left_bearing;
-        stbtt_GetCodepointHMetrics(&g_font, text[i], &advance, &left_bearing);
-        text_width += advance * stb_scale;
-        if (text[i+1]) {
-            text_width += stbtt_GetCodepointKernAdvance(&g_font, text[i], text[i+1]) * stb_scale;
-        }
-    }
-    
-    float text_height = (ascent - descent) * stb_scale;
-    float padding = 4.0f;
-    int texture_width = (int)(text_width + padding * 2);
-    int texture_height = (int)(text_height + padding * 2);
-    
-    // Create a render target texture
-    SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888,
-                                             SDL_TEXTUREACCESS_TARGET,
-                                             texture_width, texture_height);
-    if (!texture) return NULL;
-    
-    // Render to texture
-    SDL_SetRenderTarget(renderer, texture);
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    
-    // Clear with transparent
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
-    SDL_RenderClear(renderer);
-    
-    // Draw background
-    SDL_FRect bg_rect = {0, 0, (float)texture_width, (float)texture_height};
-    SDL_SetRenderDrawColor(renderer, 200, 0, 0, 230);
-    SDL_RenderFillRect(renderer, &bg_rect);
-    
-    // Draw border
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    SDL_RenderRect(renderer, &bg_rect);
-    
-    // Render text
-    float cursor_x = padding;
-    float baseline_y = padding + ascent * stb_scale;
-    
-    for (int i = 0; text[i]; i++) {
-        int advance, left_bearing;
-        stbtt_GetCodepointHMetrics(&g_font, text[i], &advance, &left_bearing);
-        
-        int glyph_width, glyph_height, xoff, yoff;
-        unsigned char *bitmap = stbtt_GetCodepointBitmap(&g_font, 0, stb_scale,
-                                                         text[i], &glyph_width, &glyph_height,
-                                                         &xoff, &yoff);
-        
-        if (bitmap) {
-            SDL_Surface *surface = SDL_CreateSurface(glyph_width, glyph_height, SDL_PIXELFORMAT_RGBA32);
-            if (surface) {
-                uint32_t *pixels = (uint32_t*)surface->pixels;
-                for (int py = 0; py < glyph_height; py++) {
-                    for (int px = 0; px < glyph_width; px++) {
-                        unsigned char alpha = bitmap[py * glyph_width + px];
-                        pixels[py * glyph_width + px] = (alpha << 24) | 0x00FFFFFF;
-                    }
-                }
-                
-                SDL_Texture *glyph_tex = SDL_CreateTextureFromSurface(renderer, surface);
-                if (glyph_tex) {
-                    SDL_SetTextureBlendMode(glyph_tex, SDL_BLENDMODE_BLEND);
-                    SDL_FRect dst = {
-                        cursor_x + left_bearing * stb_scale,
-                        baseline_y + yoff,
-                        (float)glyph_width,
-                        (float)glyph_height
-                    };
-                    SDL_RenderTexture(renderer, glyph_tex, NULL, &dst);
-                    SDL_DestroyTexture(glyph_tex);
-                }
-                SDL_DestroySurface(surface);
+    closedir(d);
+    for (int i = 0; i < *count; i++)
+        for (int j = i+1; j < *count; j++)
+            if (strcmp(arr[i].path, arr[j].path) > 0) {
+                Asset t = arr[i]; arr[i] = arr[j]; arr[j] = t;
             }
-            stbtt_FreeBitmap(bitmap, NULL);
-        }
-        
-        cursor_x += advance * stb_scale;
-        if (text[i+1]) {
-            cursor_x += stbtt_GetCodepointKernAdvance(&g_font, text[i], text[i+1]) * stb_scale;
-        }
+}
+
+static SDL_Texture* bake_text_once(SDL_Renderer *r, const char *s, int *out_w, int *out_h, SDL_Color col, float font_size) {
+    if (!g.font_data || !s[0]) return NULL;
+    float scale = stbtt_ScaleForPixelHeight(&g.font, font_size);
+    int ascent; stbtt_GetFontVMetrics(&g.font, &ascent, NULL, NULL);
+    float x = 0;
+    for (int i = 0; s[i]; i++) {
+        int adv, lsb; stbtt_GetCodepointHMetrics(&g.font, s[i], &adv, &lsb);
+        x += adv * scale + (s[i+1] ? stbtt_GetCodepointKernAdvance(&g.font, s[i], s[i+1]) * scale : 0);
     }
-    
-    // Reset render target
-    SDL_SetRenderTarget(renderer, NULL);
-    SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
-    
-    *out_width = texture_width;
-    *out_height = texture_height;
-    
-    return texture;
-}
-
-// Render damage number above token (using cached texture)
-void render_damage_number_cached(SDL_Renderer *renderer, Token *token, float x, float y, float scale, bool is_dm_view) {
-    if (token->damage <= 0) return;
-    
-    // Get the appropriate texture pointer and cached damage value
-    SDL_Texture **texture_ptr;
-    int *cached_damage_ptr;
-    
-    if (is_dm_view) {
-        texture_ptr = &token->damage_texture_dm;
-        cached_damage_ptr = &token->cached_damage_dm;
-    } else {
-        texture_ptr = &token->damage_texture_player;
-        cached_damage_ptr = &token->cached_damage_player;
-    }
-    
-    // Regenerate texture if damage changed or texture doesn't exist
-    if (*texture_ptr == NULL || *cached_damage_ptr != token->damage) {
-        // Destroy old texture if it exists
-        if (*texture_ptr) {
-            SDL_DestroyTexture(*texture_ptr);
-            *texture_ptr = NULL;
-        }
-        
-        // Create new texture for this specific renderer
-        *texture_ptr = create_damage_texture(renderer, token->damage, 
-                                             &token->damage_tex_width, 
-                                             &token->damage_tex_height);
-        *cached_damage_ptr = token->damage;
-    }
-    
-    // Render the cached texture
-    if (*texture_ptr) {
-        SDL_FRect dst = {
-            x - (token->damage_tex_width * scale) / 2,
-            y - (token->damage_tex_height * scale) - 4 * scale,
-            token->damage_tex_width * scale,
-            token->damage_tex_height * scale
-        };
-        SDL_RenderTexture(renderer, *texture_ptr, NULL, &dst);
-    }
-}
-
-// ============================================================================
-// ASSET LIBRARY
-// ============================================================================
-
-void map_library_init(MapLibrary *lib) {
-    scan_directory("assets/maps", lib->filepaths, &lib->count, 100);
-    lib->current_index = (lib->count > 0) ? 0 : -1;
-}
-
-void token_library_init(TokenLibrary *lib) {
-    scan_directory("assets/tokens", lib->filepaths, &lib->count, 100);
-    lib->current_index = (lib->count > 0) ? 0 : -1;
-}
-
-const char* map_library_get_current(MapLibrary *lib) {
-    if (lib->current_index >= 0 && lib->current_index < lib->count) {
-        return lib->filepaths[lib->current_index];
-    }
-    return NULL;
-}
-
-void map_library_next(MapLibrary *lib) {
-    if (lib->count == 0) return;
-    lib->current_index = (lib->current_index + 1) % lib->count;
-}
-
-void map_library_prev(MapLibrary *lib) {
-    if (lib->count == 0) return;
-    lib->current_index = (lib->current_index - 1 + lib->count) % lib->count;
-}
-
-// ============================================================================
-// MAP CACHE
-// ============================================================================
-
-void map_cache_init(MapCache *cache, MapLibrary *lib) {
-    cache->count = 0;
-    cache->initialized = false;
-    
-    for (int i = 0; i < lib->count && i < 100; i++) {
-        strncpy(cache->maps[i].filepath, lib->filepaths[i], sizeof(cache->maps[i].filepath) - 1);
-        cache->maps[i].pixel_data = NULL;
-        cache->maps[i].loaded = false;
-        cache->count++;
-    }
-    
-    //     SDL_Log("Map cache initialized with %d maps", cache->count);
-}
-
-void map_cache_preload(MapCache *cache, MapLibrary *lib) {
-    if (cache->initialized) return;
-    
-    for (int i = 0; i < lib->count && i < 100; i++) {
-        const char *filepath = lib->filepaths[i];
-        
-        int width, height, channels;
-        unsigned char *data = stbi_load(filepath, &width, &height, &channels, 4);
-        
-        if (data) {
-            cache->maps[i].pixel_data = data;
-            cache->maps[i].width = width;
-            cache->maps[i].height = height;
-            cache->maps[i].loaded = true;
-    //             SDL_Log("Preloaded map: %s (%dx%d)", filepath, width, height);
-        } else {
-    //             SDL_Log("Failed to preload map: %s", filepath);
-        }
-    }
-    
-    cache->initialized = true;
-}
-
-unsigned char* map_cache_get_data(MapCache *cache, const char *filepath, int *width, int *height) {
-    for (int i = 0; i < cache->count; i++) {
-        if (strcmp(cache->maps[i].filepath, filepath) == 0 && cache->maps[i].loaded) {
-            *width = cache->maps[i].width;
-            *height = cache->maps[i].height;
-            return cache->maps[i].pixel_data;
-        }
-    }
-    return NULL;
-}
-
-void map_cache_destroy(MapCache *cache) {
-    for (int i = 0; i < cache->count; i++) {
-        if (cache->maps[i].pixel_data) {
-            stbi_image_free(cache->maps[i].pixel_data);
-            cache->maps[i].pixel_data = NULL;
-        }
-        cache->maps[i].loaded = false;
-    }
-    cache->count = 0;
-    cache->initialized = false;
-}
-
-// Forward declarations for fog functions (used in grid calibration)
-bool fog_init(FogOfWar *fog, int cols, int rows);
-void fog_destroy(FogOfWar *fog);
-
-// ============================================================================
-// GRID CALIBRATION
-// ============================================================================
-
-void grid_calibration_init(GridCalibration *cal) {
-    cal->active = false;
-    cal->dragging = false;
-    cal->calibrated_size = 0;
-    cal->calibrated_offset_x = 0;
-    cal->calibrated_offset_y = 0;
-    cal->start_x = 0;
-    cal->start_y = 0;
-    cal->end_x = 0;
-    cal->end_y = 0;
-    cal->cells_wide = 2;
-    cal->cells_tall = 2;
-}
-
-void grid_calibration_start(GridCalibration *cal) {
-    cal->active = true;
-    cal->dragging = false;
-    cal->cells_wide = 2;
-    cal->cells_tall = 2;
-    //     SDL_Log("Grid calibration mode: Draw rectangle around map grid cells (default 2x2)");
-    //     SDL_Log("Use arrow keys to adjust cell count while dragging, Enter to apply, Escape to cancel");
-}
-
-void grid_calibration_apply(GridCalibration *cal, Map *map, FogOfWar *fog) {
-    int width = abs(cal->end_x - cal->start_x);
-    int height = abs(cal->end_y - cal->start_y);
-    
-    if (width < 10 || height < 10) {
-    //         SDL_Log("Rectangle too small, calibration cancelled");
-        cal->active = false;
-        return;
-    }
-    
-    // Calculate cell size by dividing rectangle by cell count
-    int grid_size_x = width / cal->cells_wide;
-    int grid_size_y = height / cal->cells_tall;
-    cal->calibrated_size = (grid_size_x + grid_size_y) / 2;
-    
-    // Get the top-left corner of the calibration rectangle
-    int rect_left = (cal->start_x < cal->end_x) ? cal->start_x : cal->end_x;
-    int rect_top = (cal->start_y < cal->end_y) ? cal->start_y : cal->end_y;
-    
-    // Calculate where the grid origin would be by extending the pattern backward
-    // This allows the grid to extend infinitely across the whole map
-    cal->calibrated_offset_x = rect_left % cal->calibrated_size;
-    cal->calibrated_offset_y = rect_top % cal->calibrated_size;
-    
-    //     SDL_Log("Grid calibrated: size=%d pixels, offset=(%d, %d), cells=%dx%d",
-    //         cal->calibrated_size, cal->calibrated_offset_x, cal->calibrated_offset_y,
-    //         cal->cells_wide, cal->cells_tall);
-    
-    // Update map grid dimensions and offset
-    map->grid_size = cal->calibrated_size;
-    map->grid_offset_x = cal->calibrated_offset_x;
-    map->grid_offset_y = cal->calibrated_offset_y;
-    // Calculate grid dimensions to cover the entire map (round up)
-    map->grid_cols = (map->width + map->grid_size - 1) / map->grid_size;
-    map->grid_rows = (map->height + map->grid_size - 1) / map->grid_size;
-    
-    // Reinitialize fog for new grid size
-    fog_destroy(fog);
-    fog_init(fog, map->grid_cols, map->grid_rows);
-    
-    cal->active = false;
-}
-
-void grid_calibration_render(SDL_Renderer *renderer, GridCalibration *cal,
-                             float camera_x, float camera_y, float zoom) {
-    if (!cal->active || !cal->dragging) return;
-    
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    
-    // Draw current rectangle with zoom transformation
-    SDL_FRect rect;
-    rect.x = (fmin(cal->start_x, cal->end_x) - camera_x) * zoom;
-    rect.y = (fmin(cal->start_y, cal->end_y) - camera_y) * zoom;
-    rect.w = abs(cal->end_x - cal->start_x) * zoom;
-    rect.h = abs(cal->end_y - cal->start_y) * zoom;
-    
-    // Blue semi-transparent fill
-    SDL_SetRenderDrawColor(renderer, 0, 100, 255, 80);
-    SDL_RenderFillRect(renderer, &rect);
-    
-    // Draw grid lines within rectangle to show cell divisions
-    float cell_width = rect.w / cal->cells_wide;
-    float cell_height = rect.h / cal->cells_tall;
-    
-    SDL_SetRenderDrawColor(renderer, 0, 150, 255, 255);
-    
-    // Vertical lines
-    for (int i = 1; i < cal->cells_wide; i++) {
-        float x = rect.x + i * cell_width;
-        SDL_RenderLine(renderer, x, rect.y, x, rect.y + rect.h);
-    }
-    
-    // Horizontal lines
-    for (int i = 1; i < cal->cells_tall; i++) {
-        float y = rect.y + i * cell_height;
-        SDL_RenderLine(renderer, rect.x, y, rect.x + rect.w, y);
-    }
-    
-    // Draw border (thicker for visibility)
-    SDL_RenderRect(renderer, &rect);
-}
-
-// ============================================================================
-// CAMERA SYSTEM
-// ============================================================================
-
-void camera_init(Camera *cam, int map_width, int map_height, int win_width, int win_height) {
-    (void)map_width;
-    (void)map_height;
-    cam->x = cam->target_x = 0;
-    cam->y = cam->target_y = 0;
-    cam->zoom = cam->target_zoom = 1.0f;
-    cam->view_width = win_width;
-    cam->view_height = win_height;
-}
-
-void camera_clamp(Camera *cam, int map_width, int map_height) {
-    (void)cam;
-    (void)map_width;
-    (void)map_height;
-    // No clamping - dark edges shown when zoomed out
-}
-
-void camera_update(Camera *cam) {
-    cam->x += (cam->target_x - cam->x) * CAMERA_SMOOTHING;
-    cam->y += (cam->target_y - cam->y) * CAMERA_SMOOTHING;
-    cam->zoom += (cam->target_zoom - cam->zoom) * CAMERA_SMOOTHING;
-}
-
-void camera_zoom_toward(Camera *cam, int mouse_x, int mouse_y, float factor, int map_width, int map_height) {
-    float new_zoom = cam->target_zoom * factor;
-    new_zoom = fminf(fmaxf(new_zoom, ZOOM_MIN), ZOOM_MAX);
-    
-    // Calculate world position of mouse using target values
-    float world_mouse_x = (mouse_x / cam->target_zoom) + cam->target_x;
-    float world_mouse_y = (mouse_y / cam->target_zoom) + cam->target_y;
-    
-    cam->target_zoom = new_zoom;
-    
-    // Set new camera position so mouse stays at same world position
-    cam->target_x = world_mouse_x - (mouse_x / new_zoom);
-    cam->target_y = world_mouse_y - (mouse_y / new_zoom);
-    
-    // No clamping - dark edges shown when zoomed out
-    (void)map_width;
-    (void)map_height;
-}
-
-void camera_pan(Camera *cam, int delta_x, int delta_y) {
-    cam->target_x -= delta_x / cam->zoom;
-    cam->target_y -= delta_y / cam->zoom;
-}
-
-void camera_set_position(Camera *cam, float x, float y, int map_width, int map_height) {
-    (void)map_width;
-    (void)map_height;
-    cam->target_x = x;
-    cam->target_y = y;
-}
-
-void camera_sync(Camera *dst, Camera *src, int map_width, int map_height) {
-    (void)map_width;
-    (void)map_height;
-    dst->target_x = src->target_x;
-    dst->target_y = src->target_y;
-    dst->target_zoom = src->target_zoom;
-    dst->x = src->x;
-    dst->y = src->y;
-    dst->zoom = src->zoom;
-}
-
-// ============================================================================
-// WINDOW MANAGER
-// ============================================================================
-
-bool window_manager_init(WindowManager *wm) {
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
-    //         SDL_Log("SDL_Init failed: %s", SDL_GetError());
-        return false;
-    }
-    
-    int display_count = 0;
-    SDL_DisplayID *displays = SDL_GetDisplays(&display_count);
-    
-    // Create DM window
-    SDL_PropertiesID dm_props = SDL_CreateProperties();
-    SDL_SetStringProperty(dm_props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "VTT - DM View");
-    SDL_SetNumberProperty(dm_props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, WINDOW_DM_WIDTH);
-    SDL_SetNumberProperty(dm_props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, WINDOW_DM_HEIGHT);
-    SDL_SetNumberProperty(dm_props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(dm_props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(dm_props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_WINDOW_RESIZABLE);
-    
-    wm->dm_window.window = SDL_CreateWindowWithProperties(dm_props);
-    SDL_DestroyProperties(dm_props);
-    
-    if (!wm->dm_window.window) {
-    //         SDL_Log("Failed to create DM window: %s", SDL_GetError());
-        return false;
-    }
-    
-    wm->dm_window.renderer = SDL_CreateRenderer(wm->dm_window.window, NULL);
-    wm->dm_window.id = SDL_GetWindowID(wm->dm_window.window);
-    wm->dm_window.type = WINDOW_TYPE_DM;
-    wm->dm_window.is_open = true;
-    
-    // Note: Drag-and-drop events are handled by SDL3 by default via SDL_EVENT_DROP_FILE
-    
-    // Create Player window (centered on second monitor)
-    SDL_PropertiesID player_props = SDL_CreateProperties();
-    SDL_SetStringProperty(player_props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "VTT - Player View");
-    SDL_SetNumberProperty(player_props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, WINDOW_PLAYER_WIDTH);
-    SDL_SetNumberProperty(player_props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, WINDOW_PLAYER_HEIGHT);
-    SDL_SetNumberProperty(player_props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_WINDOW_RESIZABLE);
-    
-    if (display_count > 1) {
-        SDL_Rect bounds;
-        SDL_GetDisplayBounds(displays[1], &bounds);
-        int x = bounds.x + (bounds.w - WINDOW_PLAYER_WIDTH) / 2;
-        int y = bounds.y + (bounds.h - WINDOW_PLAYER_HEIGHT) / 2;
-        SDL_SetNumberProperty(player_props, SDL_PROP_WINDOW_CREATE_X_NUMBER, x);
-        SDL_SetNumberProperty(player_props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, y);
-    } else {
-        SDL_SetNumberProperty(player_props, SDL_PROP_WINDOW_CREATE_X_NUMBER, 100);
-        SDL_SetNumberProperty(player_props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, 100);
-    }
-    
-    wm->player_window.window = SDL_CreateWindowWithProperties(player_props);
-    SDL_DestroyProperties(player_props);
-    
-    if (!wm->player_window.window) {
-    //         SDL_Log("Failed to create Player window: %s", SDL_GetError());
-        return false;
-    }
-    
-    wm->player_window.renderer = SDL_CreateRenderer(wm->player_window.window, NULL);
-    wm->player_window.id = SDL_GetWindowID(wm->player_window.window);
-    wm->player_window.type = WINDOW_TYPE_PLAYER;
-    wm->player_window.is_open = true;
-    
-    SDL_free(displays);
-    return true;
-}
-
-void window_manager_destroy(WindowManager *wm) {
-    if (wm->dm_window.renderer) SDL_DestroyRenderer(wm->dm_window.renderer);
-    if (wm->dm_window.window) SDL_DestroyWindow(wm->dm_window.window);
-    if (wm->player_window.renderer) SDL_DestroyRenderer(wm->player_window.renderer);
-    if (wm->player_window.window) SDL_DestroyWindow(wm->player_window.window);
-    SDL_Quit();
-}
-
-WindowState* window_manager_get_window_by_id(WindowManager *wm, SDL_WindowID id) {
-    if (wm->dm_window.id == id) return &wm->dm_window;
-    if (wm->player_window.id == id) return &wm->player_window;
-    return NULL;
-}
-
-// ============================================================================
-// MAP SYSTEM
-// ============================================================================
-
-void map_init(Map *map) {
-    map->dm_texture = NULL;
-    map->player_texture = NULL;
-    map->width = 0;
-    map->height = 0;
-    map->grid_cols = 0;
-    map->grid_rows = 0;
-    map->grid_size = DEFAULT_GRID_SIZE;
-    map->filepath[0] = '\0';
-    map->name[0] = '\0';
-}
-
-bool map_load(Map *map, const char *filepath, SDL_Renderer *dm_renderer, SDL_Renderer *player_renderer) {
-    int width, height;
-    unsigned char *data = map_cache_get_data(&g_map_cache, filepath, &width, &height);
-    bool data_from_cache = (data != NULL);
-    
-    if (!data) {
-        data = stbi_load(filepath, &width, &height, NULL, 4);
-    }
-    
-    if (!data) {
-    //         SDL_Log("Failed to load map: %s", stbi_failure_reason());
-        return false;
-    }
-    
-    SDL_Surface *surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32,
-                                                 data, width * 4);
-    if (!surface) {
-    //         SDL_Log("Failed to create surface: %s", SDL_GetError());
-        if (!data_from_cache) stbi_image_free(data);
-        return false;
-    }
-    
-    map->width = width;
-    map->height = height;
-    
-    map->grid_size = (g_grid_calibration.calibrated_size > 0)
-        ? g_grid_calibration.calibrated_size
-        : DEFAULT_GRID_SIZE;
-    
-    map->grid_offset_x = (g_grid_calibration.calibrated_size > 0)
-        ? g_grid_calibration.calibrated_offset_x
-        : 0;
-    map->grid_offset_y = (g_grid_calibration.calibrated_size > 0)
-        ? g_grid_calibration.calibrated_offset_y
-        : 0;
-    
-    map->grid_cols = (map->width + map->grid_size - 1) / map->grid_size;
-    map->grid_rows = (map->height + map->grid_size - 1) / map->grid_size;
-    
-    strncpy(map->filepath, filepath, sizeof(map->filepath) - 1);
-    extract_filename(filepath, map->name, sizeof(map->name));
-    
-    map->dm_texture = SDL_CreateTextureFromSurface(dm_renderer, surface);
-    map->player_texture = SDL_CreateTextureFromSurface(player_renderer, surface);
-    
-    SDL_DestroySurface(surface);
-    
-    if (!data_from_cache) {
-        stbi_image_free(data);
-    }
-    
-    if (!map->dm_texture || !map->player_texture) {
-    //         SDL_Log("Failed to create textures: %s", SDL_GetError());
-        return false;
-    }
-    
-    //     SDL_Log("Map loaded: %s (%dx%d, grid %dx%d)%s", filepath, map->width, map->height,
-    //         map->grid_cols, map->grid_rows, data_from_cache ? " (from cache)" : "");
-    
-    return true;
-}
-
-void map_destroy(Map *map) {
-    if (map->dm_texture) SDL_DestroyTexture(map->dm_texture);
-    if (map->player_texture) SDL_DestroyTexture(map->player_texture);
-    map->dm_texture = NULL;
-    map->player_texture = NULL;
-}
-
-// ============================================================================
-// GRID SYSTEM
-// ============================================================================
-
-void grid_world_to_grid(int world_x, int world_y,
-                        int grid_size, int grid_offset_x, int grid_offset_y,
-                        int *grid_x, int *grid_y) {
-    *grid_x = (world_x - grid_offset_x) / grid_size;
-    *grid_y = (world_y - grid_offset_y) / grid_size;
-}
-
-void grid_grid_to_world(int grid_x, int grid_y,
-                        int grid_size, int grid_offset_x, int grid_offset_y,
-                        int *world_x, int *world_y) {
-    *world_x = grid_x * grid_size + grid_offset_x;
-    *world_y = grid_y * grid_size + grid_offset_y;
-}
-
-SDL_FRect grid_get_cell_world_rect(int grid_x, int grid_y, int camera_x, int camera_y,
-                                   int grid_size, int grid_offset_x, int grid_offset_y) {
-    SDL_FRect rect;
-    rect.x = grid_x * grid_size + grid_offset_x - camera_x;
-    rect.y = grid_y * grid_size + grid_offset_y - camera_y;
-    rect.w = grid_size;
-    rect.h = grid_size;
-    return rect;
-}
-
-void grid_screen_to_grid_direct(float screen_x, float screen_y,
-                                float camera_x, float camera_y, float zoom,
-                                int grid_size, int grid_offset_x, int grid_offset_y,
-                                int *grid_x, int *grid_y) {
-    // Screen → World → Grid in one call
-    int world_x = (int)(screen_x / zoom + camera_x);
-    int world_y = (int)(screen_y / zoom + camera_y);
-    *grid_x = (world_x - grid_offset_x) / grid_size;
-    *grid_y = (world_y - grid_offset_y) / grid_size;
-}
-
-void grid_render(SDL_Renderer *renderer, const Map *map, int camera_x, int camera_y,
-                 int window_width, int window_height, float zoom) {
-    if (!map->dm_texture) return;
-    
-    SDL_SetRenderDrawColor(renderer, 100, 100, 100, 128);
-    
-    int grid_size = map->grid_size;
-    int grid_offset_x = map->grid_offset_x;
-    int grid_offset_y = map->grid_offset_y;
-    
-    // Calculate visible grid range accounting for zoom
-    int start_col = (camera_x - grid_offset_x) / grid_size;
-    int end_col = ((camera_x + window_width / zoom) - grid_offset_x) / grid_size + 1;
-    int start_row = (camera_y - grid_offset_y) / grid_size;
-    int end_row = ((camera_y + window_height / zoom) - grid_offset_y) / grid_size + 1;
-    
-    if (start_col < 0) start_col = 0;
-    if (start_row < 0) start_row = 0;
-    if (end_col > map->grid_cols) end_col = map->grid_cols;
-    if (end_row > map->grid_rows) end_row = map->grid_rows;
-    
-    // Vertical lines (apply zoom transformation to stay with map)
-    for (int x = start_col; x <= end_col; x++) {
-        float screen_x = (x * grid_size + grid_offset_x - camera_x) * zoom;
-        SDL_RenderLine(renderer, screen_x, 0, screen_x, window_height);
-    }
-    
-    // Horizontal lines (apply zoom transformation to stay with map)
-    for (int y = start_row; y <= end_row; y++) {
-        float screen_y = (y * grid_size + grid_offset_y - camera_y) * zoom;
-        SDL_RenderLine(renderer, 0, screen_y, window_width, screen_y);
-    }
-}
-
-// ============================================================================
-// FOG OF WAR
-// ============================================================================
-
-bool fog_init(FogOfWar *fog, int cols, int rows) {
-    fog->cols = cols;
-    fog->rows = rows;
-    fog->cells = malloc(rows * sizeof(bool*));
-    if (!fog->cells) return false;
-    
-    for (int i = 0; i < rows; i++) {
-        fog->cells[i] = malloc(cols * sizeof(bool));
-        if (!fog->cells[i]) {
-            for (int j = 0; j < i; j++) {
-                free(fog->cells[j]);
-            }
-            free(fog->cells);
-            return false;
-        }
-        // Initialize all cells to visible (true) by default
-        for (int j = 0; j < cols; j++) {
-            fog->cells[i][j] = true;
-        }
-    }
-    
-    return true;
-}
-
-void fog_destroy(FogOfWar *fog) {
-    if (fog->cells) {
-        for (int i = 0; i < fog->rows; i++) {
-            free(fog->cells[i]);
-        }
-        free(fog->cells);
-        fog->cells = NULL;
-    }
-}
-
-bool fog_is_visible(const FogOfWar *fog, int grid_x, int grid_y) {
-    if (grid_x < 0 || grid_x >= fog->cols || grid_y < 0 || grid_y >= fog->rows) {
-        return false;
-    }
-    return fog->cells[grid_y][grid_x];
-}
-
-void fog_toggle_cell(FogOfWar *fog, int grid_x, int grid_y) {
-    if (grid_x >= 0 && grid_x < fog->cols && grid_y >= 0 && grid_y < fog->rows) {
-        fog->cells[grid_y][grid_x] = !fog->cells[grid_y][grid_x];
-    }
-}
-
-void fog_set_cell(FogOfWar *fog, int grid_x, int grid_y, bool visible) {
-    if (grid_x >= 0 && grid_x < fog->cols && grid_y >= 0 && grid_y < fog->rows) {
-        fog->cells[grid_y][grid_x] = visible;
-    }
-}
-
-void fog_reveal_all(FogOfWar *fog) {
-    for (int y = 0; y < fog->rows; y++) {
-        for (int x = 0; x < fog->cols; x++) {
-            fog->cells[y][x] = true;
-        }
-    }
-}
-
-void fog_hide_all(FogOfWar *fog) {
-    for (int y = 0; y < fog->rows; y++) {
-        for (int x = 0; x < fog->cols; x++) {
-            fog->cells[y][x] = false;
-        }
-    }
-}
-
-void fog_render(SDL_Renderer *renderer, const FogOfWar *fog, float camera_x, float camera_y,
-                int window_width, int window_height, int grid_size,
-                int grid_offset_x, int grid_offset_y,
-                float zoom, bool is_dm_view) {
-    if (!fog->cells) return;
-    
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, is_dm_view ? 180 : 255);
-    
-    // Calculate visible grid range accounting for zoom and grid offset
-    int start_col = ((int)camera_x - grid_offset_x) / grid_size;
-    int end_col = ((int)(camera_x + window_width / zoom) - grid_offset_x) / grid_size + 1;
-    int start_row = ((int)camera_y - grid_offset_y) / grid_size;
-    int end_row = ((int)(camera_y + window_height / zoom) - grid_offset_y) / grid_size + 1;
-    
-    if (end_col > fog->cols) end_col = fog->cols;
-    if (end_row > fog->rows) end_row = fog->rows;
-    if (start_col < 0) start_col = 0;
-    if (start_row < 0) start_row = 0;
-    
-    for (int y = start_row; y < end_row; y++) {
-        for (int x = start_col; x < end_col; x++) {
-            if (!fog->cells[y][x]) {
-                SDL_FRect rect = grid_get_cell_world_rect(x, y, (int)camera_x, (int)camera_y, grid_size, grid_offset_x, grid_offset_y);
-                rect.x *= zoom;
-                rect.y *= zoom;
-                rect.w *= zoom;
-                rect.h *= zoom;
-                SDL_RenderFillRect(renderer, &rect);
-            }
-        }
-    }
-}
-
-// ============================================================================
-// DRAWING SYSTEM
-// ============================================================================
-
-void drawing_manager_init(DrawingManager *mgr) {
-    mgr->count = 0;
-}
-
-void drawing_add(DrawingManager *mgr, ShapeType type, int x1, int y1, int x2, int y2, int color_index) {
-    if (mgr->count >= MAX_DRAWINGS) {
-    //         SDL_Log("Max drawings reached");
-        return;
-    }
-    
-    Drawing *d = &mgr->drawings[mgr->count];
-    d->type = type;
-    d->x1 = x1;
-    d->y1 = y1;
-    d->x2 = x2;
-    d->y2 = y2;
-    d->color_index = color_index;
-    d->filled = true;
-    d->cached_texture_dm = NULL;
-    d->cached_texture_player = NULL;
-    d->cached_width = 0;
-    d->cached_height = 0;
-    
-    mgr->count++;
-    //     SDL_Log("Drawing added: type=%d, color=%s", type, SQUAD_COLORS[color_index].name);
-}
-
-// Check if point is inside a drawing (for right-click deletion)
-bool drawing_contains_point(const Drawing *d, int world_x, int world_y) {
-    if (d->type == SHAPE_RECTANGLE) {
-        int min_x = (d->x1 < d->x2) ? d->x1 : d->x2;
-        int max_x = (d->x1 > d->x2) ? d->x1 : d->x2;
-        int min_y = (d->y1 < d->y2) ? d->y1 : d->y2;
-        int max_y = (d->y1 > d->y2) ? d->y1 : d->y2;
-        
-        return world_x >= min_x && world_x <= max_x && world_y >= min_y && world_y <= max_y;
-    } else if (d->type == SHAPE_CIRCLE) {
-        int cx = (d->x1 + d->x2) / 2;
-        int cy = (d->y1 + d->y2) / 2;
-        int dx = d->x2 - d->x1;
-        int dy = d->y2 - d->y1;
-        int radius_sq = (dx * dx + dy * dy) / 4;
-        
-        int dist_x = world_x - cx;
-        int dist_y = world_y - cy;
-        int dist_sq = dist_x * dist_x + dist_y * dist_y;
-        
-        return dist_sq <= radius_sq;
-    }
-    return false;
-}
-
-void drawing_remove(DrawingManager *mgr, int index) {
-    if (index < 0 || index >= mgr->count) return;
-    
-    // Free cached textures
-    if (mgr->drawings[index].cached_texture_dm) {
-        SDL_DestroyTexture(mgr->drawings[index].cached_texture_dm);
-    }
-    if (mgr->drawings[index].cached_texture_player) {
-        SDL_DestroyTexture(mgr->drawings[index].cached_texture_player);
-    }
-    
-    // Shift remaining drawings
-    for (int i = index; i < mgr->count - 1; i++) {
-        mgr->drawings[i] = mgr->drawings[i + 1];
-    }
-    
-    mgr->count--;
-    //     SDL_Log("Drawing removed");
-}
-
-// Optimized circle rendering using scanlines
-void render_filled_circle(SDL_Renderer *renderer, float cx, float cy, float radius) {
-    if (radius < 1) return;
-    
-    // Use scanline algorithm - much faster than pixel-by-pixel
-    int r = (int)radius;
-    for (int y = -r; y <= r; y++) {
-        int half_width = (int)sqrtf(radius * radius - y * y);
-        if (half_width > 0) {
-            SDL_FRect line = {
-                cx - half_width,
-                cy + y,
-                half_width * 2,
-                1
-            };
-            SDL_RenderFillRect(renderer, &line);
-        }
-    }
-}
-
-void drawing_render_all(SDL_Renderer *renderer, const DrawingManager *mgr,
-                        int camera_x, int camera_y, float zoom) {
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    
-    for (int i = 0; i < mgr->count; i++) {
-        const Drawing *d = &mgr->drawings[i];
-        const SquadColor *color = &SQUAD_COLORS[d->color_index];
-        
-        // Semi-transparent (alpha = 128)
-        SDL_SetRenderDrawColor(renderer, color->r, color->g, color->b, 128);
-        
-        if (d->type == SHAPE_RECTANGLE) {
-            SDL_FRect rect = {
-                (d->x1 - camera_x) * zoom,
-                (d->y1 - camera_y) * zoom,
-                (d->x2 - d->x1) * zoom,
-                (d->y2 - d->y1) * zoom
-            };
-            
-            // Normalize rect (in case dragged backwards)
-            if (rect.w < 0) {
-                rect.x += rect.w;
-                rect.w = -rect.w;
-            }
-            if (rect.h < 0) {
-                rect.y += rect.h;
-                rect.h = -rect.h;
-            }
-            
-            SDL_RenderFillRect(renderer, &rect);
-            
-            // Draw border
-            SDL_SetRenderDrawColor(renderer, color->r, color->g, color->b, 255);
-            SDL_RenderRect(renderer, &rect);
-            
-        } else if (d->type == SHAPE_CIRCLE) {
-            // Draw circle with optimized scanline algorithm
-            float cx = ((d->x1 + d->x2) / 2.0f - camera_x) * zoom;
-            float cy = ((d->y1 + d->y2) / 2.0f - camera_y) * zoom;
-            float radius = sqrtf(powf((d->x2 - d->x1) * zoom, 2) + powf((d->y2 - d->y1) * zoom, 2)) / 2.0f;
-            
-            render_filled_circle(renderer, cx, cy, radius);
-            
-            // Draw border using Bresenham's circle algorithm (outline only)
-            SDL_SetRenderDrawColor(renderer, color->r, color->g, color->b, 255);
-            int r = (int)radius;
-            int x = 0;
-            int y = r;
-            int d = 3 - 2 * r;
-            
-            while (y >= x) {
-                // Draw 8 octants
-                SDL_RenderPoint(renderer, cx + x, cy + y);
-                SDL_RenderPoint(renderer, cx - x, cy + y);
-                SDL_RenderPoint(renderer, cx + x, cy - y);
-                SDL_RenderPoint(renderer, cx - x, cy - y);
-                SDL_RenderPoint(renderer, cx + y, cy + x);
-                SDL_RenderPoint(renderer, cx - y, cy + x);
-                SDL_RenderPoint(renderer, cx + y, cy - x);
-                SDL_RenderPoint(renderer, cx - y, cy - x);
-                
-                x++;
-                if (d > 0) {
-                    y--;
-                    d = d + 4 * (x - y) + 10;
-                } else {
-                    d = d + 4 * x + 6;
+    int w = (int)x + 8, h = (int)font_size + 8;
+    SDL_Texture *t = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, w, h);
+    if (!t) return NULL;
+    SDL_SetRenderTarget(r, t);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 0);
+    SDL_RenderClear(r);
+    x = 4;
+    float y = 4 + ascent * scale;
+    for (int i = 0; s[i]; i++) {
+        int adv, lsb; stbtt_GetCodepointHMetrics(&g.font, s[i], &adv, &lsb);
+        int gw, gh, xoff, yoff;
+        unsigned char *bmp = stbtt_GetCodepointBitmap(&g.font, 0, scale, s[i], &gw, &gh, &xoff, &yoff);
+        if (bmp) {
+            for (int py = 0; py < gh; py++) for (int px = 0; px < gw; px++) {
+                if ((int)x+px+xoff >= 0 && (int)x+px+xoff < w && (int)y+py+yoff >= 0 && (int)y+py+yoff < h && bmp[py*gw+px]) {
+                    SDL_SetRenderDrawColor(r, col.r, col.g, col.b, bmp[py*gw+px]);
+                    SDL_RenderPoint(r, x+px+xoff, y+py+yoff);
                 }
             }
+            stbtt_FreeBitmap(bmp, NULL);
         }
+        x += adv * scale;
     }
+    SDL_SetRenderTarget(r, NULL);
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    *out_w = w; *out_h = h;
+    return t;
 }
 
-void drawing_clear_all(DrawingManager *mgr) {
-    // Free all cached textures
-    for (int i = 0; i < mgr->count; i++) {
-        if (mgr->drawings[i].cached_texture_dm) {
-            SDL_DestroyTexture(mgr->drawings[i].cached_texture_dm);
-        }
-        if (mgr->drawings[i].cached_texture_player) {
-            SDL_DestroyTexture(mgr->drawings[i].cached_texture_player);
-        }
-    }
-    mgr->count = 0;
-    //     SDL_Log("All drawings cleared");
+static void update_cached_text(CachedText *c, SDL_Renderer *r, const char *s, SDL_Color col) {
+    if (c->tex && !strcmp(c->text, s)) return;
+    if (c->tex) SDL_DestroyTexture(c->tex);
+    strncpy(c->text, s, 63);
+    c->tex = bake_text_once(r, s, &c->w, &c->h, col, 20.0f);
 }
 
-// ============================================================================
-// TOKEN SYSTEM
-// ============================================================================
-
-// Forward declarations
-void render_token_conditions(SDL_Renderer *renderer, const Token *token, float x, float y, float scale);
-
-void token_manager_init(TokenManager *mgr) {
-    mgr->count = 0;
-}
-
-void token_manager_destroy(TokenManager *mgr) {
-    for (int i = 0; i < mgr->count; i++) {
-        if (mgr->tokens[i].dm_texture) SDL_DestroyTexture(mgr->tokens[i].dm_texture);
-        if (mgr->tokens[i].player_texture) SDL_DestroyTexture(mgr->tokens[i].player_texture);
-        if (mgr->tokens[i].damage_texture_dm) SDL_DestroyTexture(mgr->tokens[i].damage_texture_dm);
-        if (mgr->tokens[i].damage_texture_player) SDL_DestroyTexture(mgr->tokens[i].damage_texture_player);
+static int load_asset_to_both(const char *path, Asset *slot) {
+    int w, h;
+    unsigned char *data = stbi_load(path, &w, &h, NULL, 4);
+    if (!data) return -1;
+    strncpy(slot->path, path, 255);
+    slot->path[255] = '\0';
+    slot->w = w; slot->h = h;
+    SDL_Surface *s = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_RGBA32, data, w*4);
+    if (s) {
+        slot->tex[0] = SDL_CreateTextureFromSurface(g.dm.ren, s);
+        slot->tex[1] = SDL_CreateTextureFromSurface(g.player.ren, s);
+        SDL_DestroySurface(s);
     }
-    mgr->count = 0;
-}
-
-int token_add(TokenManager *mgr, const char *filepath, int grid_x, int grid_y,
-              SDL_Renderer *dm_renderer, SDL_Renderer *player_renderer, const char *name) {
-    if (mgr->count >= MAX_TOKENS) return -1;
-    
-    int width, height, channels;
-    unsigned char *data = stbi_load(filepath, &width, &height, &channels, 4); // Force RGBA
-    
-    if (!data) {
-    //         SDL_Log("Failed to load token: %s", stbi_failure_reason());
-        return -1;
-    }
-    
-    SDL_Surface *surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32,
-                                                 data, width * 4);
-    if (!surface) {
-    //         SDL_Log("Failed to create surface: %s", SDL_GetError());
-        stbi_image_free(data);
-        return -1;
-    }
-    
-    Token *token = &mgr->tokens[mgr->count];
-    token->dm_texture = SDL_CreateTextureFromSurface(dm_renderer, surface);
-    token->player_texture = SDL_CreateTextureFromSurface(player_renderer, surface);
-    token->width = surface->w;
-    token->height = surface->h;
-    token->grid_x = grid_x;
-    token->grid_y = grid_y;
-    token->grid_size = 1;  // Default to 1x1 grid cell
-    token->selected = false;
-    token->hidden = false;
-    token->damage = 0;  // Initialize damage to 0
-    token->squad = -1;  // Initialize to no squad
-    token->opacity = 255;  // Fully opaque by default
-    for (int i = 0; i < CONDITION_COUNT; i++) {
-        token->conditions[i] = false;
-    }
-    token->damage_texture_dm = NULL;
-    token->damage_texture_player = NULL;
-    token->cached_damage_dm = -1;
-    token->cached_damage_player = -1;
-    token->damage_tex_width = 0;
-    token->damage_tex_height = 0;
-    strncpy(token->name, name ? name : "token", sizeof(token->name) - 1);
-    strncpy(token->filepath, filepath, sizeof(token->filepath) - 1);
-    
-    SDL_DestroySurface(surface);
     stbi_image_free(data);
-    
-    if (!token->dm_texture || !token->player_texture) {
-    //         SDL_Log("Failed to create token textures: %s", SDL_GetError());
-        return -1;
-    }
-    
-    mgr->count++;
-    //     SDL_Log("Token added: %s at (%d, %d)", filepath, grid_x, grid_y);
-    return mgr->count - 1;
+    slot->loaded = (slot->tex[0] && slot->tex[1]);
+    return slot->loaded ? 0 : -1;
 }
 
-Token* token_get_at_grid(TokenManager *mgr, int grid_x, int grid_y) {
-    for (int i = mgr->count - 1; i >= 0; i--) {
-        if (mgr->tokens[i].grid_x == grid_x && mgr->tokens[i].grid_y == grid_y) {
-            return &mgr->tokens[i];
-        }
+static int load_asset_from_memory(unsigned char *data, int data_len, Asset *slot, const char *name) {
+    int w, h;
+    unsigned char *pixels = stbi_load_from_memory(data, data_len, &w, &h, NULL, 4);
+    if (!pixels) return -1;
+    strncpy(slot->path, name, 255);
+    slot->path[255] = '\0';
+    slot->w = w; slot->h = h;
+    SDL_Surface *s = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_RGBA32, pixels, w*4);
+    if (s) {
+        slot->tex[0] = SDL_CreateTextureFromSurface(g.dm.ren, s);
+        slot->tex[1] = SDL_CreateTextureFromSurface(g.player.ren, s);
+        SDL_DestroySurface(s);
     }
-    return NULL;
+    stbi_image_free(pixels);
+    slot->loaded = (slot->tex[0] && slot->tex[1]);
+    return slot->loaded ? 0 : -1;
 }
 
-void token_deselect_all(TokenManager *mgr) {
-    for (int i = 0; i < mgr->count; i++) {
-        mgr->tokens[i].selected = false;
-    }
-}
-
-void token_remove(TokenManager *mgr, int index) {
-    if (index < 0 || index >= mgr->count) return;
-    
-    // Destroy textures for the token being removed
-    if (mgr->tokens[index].dm_texture) {
-        SDL_DestroyTexture(mgr->tokens[index].dm_texture);
-    }
-    if (mgr->tokens[index].player_texture) {
-        SDL_DestroyTexture(mgr->tokens[index].player_texture);
-    }
-    if (mgr->tokens[index].damage_texture_dm) {
-        SDL_DestroyTexture(mgr->tokens[index].damage_texture_dm);
-    }
-    if (mgr->tokens[index].damage_texture_player) {
-        SDL_DestroyTexture(mgr->tokens[index].damage_texture_player);
-    }
-    
-    // Shift remaining tokens down
-    for (int i = index; i < mgr->count - 1; i++) {
-        mgr->tokens[i] = mgr->tokens[i + 1];
-    }
-    
-    mgr->count--;
-    //     SDL_Log("Token removed at index %d", index);
-}
-
-void token_resize(TokenManager *mgr, int index, int delta) {
-    if (index < 0 || index >= mgr->count) return;
-    Token *t = &mgr->tokens[index];
-    int new_size = t->grid_size + delta;
-    if (new_size >= 1 && new_size <= 4) {
-        t->grid_size = new_size;
-    //         SDL_Log("Token resized to %dx%d", new_size, new_size);
+static void ensure_asset_loaded(Asset *slot) {
+    if (!slot->loaded && slot->path[0]) {
+        load_asset_to_both(slot->path, slot);
     }
 }
 
-int token_copy(TokenManager *mgr, int index, int new_grid_x, int new_grid_y,
-               SDL_Renderer *dm_renderer, SDL_Renderer *player_renderer) {
-    if (index < 0 || index >= mgr->count) return -1;
-    if (mgr->count >= MAX_TOKENS) return -1;
-    
-    Token *src = &mgr->tokens[index];
-    
-    int width, height, channels;
-    unsigned char *data = stbi_load(src->filepath, &width, &height, &channels, 4);
-    if (!data) {
-    //         SDL_Log("Failed to reload token for copy: %s", stbi_failure_reason());
-        return -1;
-    }
-    
-    SDL_Surface *surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32,
-                                                 data, width * 4);
-    if (!surface) {
-    //         SDL_Log("Failed to create surface for token copy: %s", SDL_GetError());
-        stbi_image_free(data);
-        return -1;
-    }
-    
-    Token *dst = &mgr->tokens[mgr->count];
-    dst->dm_texture = SDL_CreateTextureFromSurface(dm_renderer, surface);
-    dst->player_texture = SDL_CreateTextureFromSurface(player_renderer, surface);
-    dst->width = surface->w;
-    dst->height = surface->h;
-    dst->grid_x = new_grid_x;
-    dst->grid_y = new_grid_y;
-    dst->grid_size = src->grid_size;
-    dst->selected = false;
-    dst->hidden = src->hidden;
-    dst->damage = src->damage;
-    dst->squad = src->squad;
-    dst->opacity = src->opacity;
-    for (int i = 0; i < CONDITION_COUNT; i++) {
-        dst->conditions[i] = src->conditions[i];
-    }
-    dst->damage_texture_dm = NULL;
-    dst->damage_texture_player = NULL;
-    dst->cached_damage_dm = -1;
-    dst->cached_damage_player = -1;
-    dst->damage_tex_width = 0;
-    dst->damage_tex_height = 0;
-    strncpy(dst->name, src->name, sizeof(dst->name) - 1);
-    strncpy(dst->filepath, src->filepath, sizeof(dst->filepath) - 1);
-    
-    SDL_DestroySurface(surface);
-    stbi_image_free(data);
-    
-    if (!dst->dm_texture || !dst->player_texture) {
-    //         SDL_Log("Failed to create textures for token copy: %s", SDL_GetError());
-        return -1;
-    }
-    
-    mgr->count++;
-    //     SDL_Log("Token copied: %s to (%d, %d)", src->name, new_grid_x, new_grid_y);
-    return mgr->count - 1;
+static int find_or_load_token_image(const char *path) {
+    for (int i = 0; i < g.token_lib_count; i++)
+        if (!strcmp(g.token_lib[i].path, path)) return i;
+    if (g.token_lib_count >= MAX_ASSETS) return -1;
+    if (load_asset_to_both(path, &g.token_lib[g.token_lib_count]) == 0)
+        return g.token_lib_count++;
+    return -1;
 }
 
-void token_toggle_hidden(TokenManager *mgr, int index) {
-    if (index < 0 || index >= mgr->count) return;
-    mgr->tokens[index].hidden = !mgr->tokens[index].hidden;
-    //     SDL_Log("Token %s: %s", mgr->tokens[index].name,
-    //         mgr->tokens[index].hidden ? "hidden" : "visible");
-}
-
-void token_render(SDL_Renderer *renderer, const Token *token, int camera_x, int camera_y,
-                  int grid_size, int grid_offset_x, int grid_offset_y,
-                  float zoom, bool is_dm_view, const FogOfWar *fog) {
-    if (!is_dm_view && !fog_is_visible(fog, token->grid_x, token->grid_y)) {
-        return;
-    }
-    
-    if (!is_dm_view && token->hidden) {
-        return;
-    }
-    
-    SDL_Texture *texture = is_dm_view ? token->dm_texture : token->player_texture;
-    if (!texture) return;
-    
-    // Set opacity: hidden tokens in DM view = 128, otherwise use token's opacity setting
-    uint8_t alpha = token->opacity;
-    if (is_dm_view && token->hidden) {
-        alpha = 128;
-    }
-    SDL_SetTextureAlphaMod(texture, alpha);
-    
-    int token_pixel_width = grid_size * token->grid_size;
-    float scale = (float)token_pixel_width / token->width;
-    float scaled_w = token->width * scale * zoom;
-    float scaled_h = token->height * scale * zoom;
-    
-    SDL_FRect dst;
-    dst.x = (token->grid_x * grid_size + grid_offset_x - camera_x) * zoom;
-    dst.y = (token->grid_y * grid_size + grid_offset_y - camera_y) * zoom - (scaled_h - grid_size * zoom);
-    dst.w = scaled_w;
-    dst.h = scaled_h;
-    
-    // Draw squad ring if token is in a squad (optimized with filled rectangles)
-    if (token->squad >= 0 && token->squad < SQUAD_COLOR_COUNT) {
-        const SquadColor *color = &SQUAD_COLORS[token->squad];
-        SDL_SetRenderDrawColor(renderer, color->r, color->g, color->b, 255);
-        
-        float ring_thickness = 3.0f * zoom;
-        float expand = ring_thickness;
-        
-        // Draw as 4 filled rectangles (top, bottom, left, right)
-        SDL_FRect rects[4] = {
-            {dst.x - expand, dst.y - expand, dst.w + 2*expand, ring_thickness},  // Top
-            {dst.x - expand, dst.y + dst.h + expand - ring_thickness, dst.w + 2*expand, ring_thickness},  // Bottom
-            {dst.x - expand, dst.y, ring_thickness, dst.h},  // Left
-            {dst.x + dst.w + expand - ring_thickness, dst.y, ring_thickness, dst.h}  // Right
-        };
-        SDL_RenderFillRects(renderer, rects, 4);
-    }
-    
-    SDL_RenderTexture(renderer, texture, NULL, &dst);
-    
-    if (token->selected && is_dm_view) {
-        SDL_SetRenderDrawColor(renderer, 255, 255, 0, 255);
-        SDL_RenderRect(renderer, &dst);
-    }
-    
-    // Render damage number above token (using cached texture)
-    if (token->damage > 0) {
-        float damage_x = dst.x + dst.w / 2;
-        float damage_y = dst.y;
-        // Pass token pointer so we can access/update cached texture
-        render_damage_number_cached(renderer, (Token*)token, damage_x, damage_y, zoom, is_dm_view);
-    }
-    
-    // Render condition indicators below token
-    float condition_x = dst.x + dst.w / 2;
-    float condition_y = dst.y + dst.h;
-    render_token_conditions(renderer, token, condition_x, condition_y, zoom);
-}
-
-void token_manager_render_all(SDL_Renderer *renderer, const TokenManager *mgr,
-                              int camera_x, int camera_y, int grid_size,
-                              int grid_offset_x, int grid_offset_y,
-                              float zoom, bool is_dm_view, const FogOfWar *fog) {
-    for (int i = 0; i < mgr->count; i++) {
-        token_render(renderer, &mgr->tokens[i], camera_x, camera_y, grid_size,
-                     grid_offset_x, grid_offset_y, zoom, is_dm_view, fog);
+static void fog_init(int w, int h) {
+    g.fog = realloc(g.fog, w * h);
+    if (g.fog) {
+        memset(g.fog, 1, w * h);
+        g.fog_w = w; g.fog_h = h;
     }
 }
 
-// ============================================================================
-// SAVE/LOAD SYSTEM
-// ============================================================================
-
-bool save_to_slot(int slot, const Map *map, const TokenManager *tokens, const FogOfWar *fog, const InputState *input, const Camera *camera) {
-    char filepath[512];
-    snprintf(filepath, sizeof(filepath), "saves/slot_%d.vtt", slot);
-    
-    FILE *f = fopen(filepath, "wb");
-    if (!f) {
-    //         SDL_Log("Failed to open save file: %s", filepath);
-        return false;
-    }
-    
-    SaveFileHeader header = {0};
-    header.magic = 0x56545401;
-    strncpy(header.map_path, map->filepath, sizeof(header.map_path) - 1);
-    make_path_relative(header.map_path, sizeof(header.map_path));
-    normalize_path_slashes(header.map_path);
-    header.token_count = tokens->count;
-    header.fog_cols = fog->cols;
-    header.fog_rows = fog->rows;
-    header.grid_size = map->grid_size;
-    header.grid_offset_x = map->grid_offset_x;
-    header.grid_offset_y = map->grid_offset_y;
-    header.show_grid = input->show_grid ? 1 : 0;
-    header.camera_x = camera->target_x;
-    header.camera_y = camera->target_y;
-    header.camera_zoom = camera->target_zoom;
-    
-    fwrite(&header, sizeof(header), 1, f);
-    
-    for (int i = 0; i < tokens->count; i++) {
-        char normalized_path[256];
-        strncpy(normalized_path, tokens->tokens[i].filepath, sizeof(normalized_path) - 1);
-        make_path_relative(normalized_path, sizeof(normalized_path));
-        normalize_path_slashes(normalized_path);
-        fwrite(normalized_path, 256, 1, f);
-        fwrite(&tokens->tokens[i].grid_x, sizeof(int), 1, f);
-        fwrite(&tokens->tokens[i].grid_y, sizeof(int), 1, f);
-        fwrite(&tokens->tokens[i].grid_size, sizeof(int), 1, f);
-        fwrite(&tokens->tokens[i].name, 64, 1, f);
-        fwrite(&tokens->tokens[i].hidden, sizeof(bool), 1, f);
-        fwrite(&tokens->tokens[i].damage, sizeof(int), 1, f);
-        fwrite(&tokens->tokens[i].squad, sizeof(int), 1, f);
-        fwrite(&tokens->tokens[i].opacity, sizeof(uint8_t), 1, f);
-        fwrite(tokens->tokens[i].conditions, sizeof(bool), CONDITION_COUNT, f);
-    }
-    
-    for (int y = 0; y < fog->rows; y++) {
-        fwrite(fog->cells[y], sizeof(bool), fog->cols, f);
-    }
-    
-    fclose(f);
-    //     SDL_Log("Saved to slot %d", slot);
-    return true;
+static inline bool fog_get(int x, int y) {
+    return (x >= 0 && x < g.fog_w && y >= 0 && y < g.fog_h) ? g.fog[y*g.fog_w+x] : false;
 }
 
-bool load_from_slot(int slot, Map *map, TokenManager *tokens, FogOfWar *fog, InputState *input,
-                    SDL_Renderer *dm_renderer, SDL_Renderer *player_renderer, Camera *camera) {
-    char filepath[512];
-    snprintf(filepath, sizeof(filepath), "saves/slot_%d.vtt", slot);
-    
-    FILE *f = fopen(filepath, "rb");
-    if (!f) {
-    //         SDL_Log("Failed to open save file: %s", filepath);
-        return false;
-    }
-    
-    // Get file size to determine format
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    if (file_size < (long)sizeof(SaveFileHeader)) {
-    //         SDL_Log("Save file too small: %s", filepath);
-        fclose(f);
-        return false;
-    }
-    
-    SaveFileHeader header;
-    if (fread(&header, sizeof(header), 1, f) != 1) {
-    //         SDL_Log("Failed to read save file header");
-        fclose(f);
-        return false;
-    }
-    
-    if (header.magic != 0x56545401) {
-    //         SDL_Log("Invalid save file magic: 0x%08X (expected 0x56545401)", header.magic);
-        fclose(f);
-        return false;
-    }
-    
-    // Calculate expected file sizes for different versions
-    // V1: filepath(256) + grid_x,y,size(12) + name(64) + hidden(1) = 333 bytes per token
-    // V2: V1 + damage(4) = 337 bytes per token
-    // V3: V2 + squad(4) = 341 bytes per token
-    // V4: V3 + opacity(1) = 342 bytes per token
-    // V5: V4 + conditions(CONDITION_COUNT bools) = 342 + CONDITION_COUNT bytes per token
-    size_t token_data_size_v1 = header.token_count * (256 + sizeof(int)*3 + 64 + sizeof(bool));
-    size_t token_data_size_v2 = header.token_count * (256 + sizeof(int)*4 + 64 + sizeof(bool));
-    size_t token_data_size_v3 = header.token_count * (256 + sizeof(int)*5 + 64 + sizeof(bool));
-    size_t token_data_size_v4 = header.token_count * (256 + sizeof(int)*5 + 64 + sizeof(bool) + sizeof(uint8_t));
-    size_t token_data_size_v5 = header.token_count * (256 + sizeof(int)*5 + 64 + sizeof(bool) + sizeof(uint8_t) + sizeof(bool)*CONDITION_COUNT);
-    size_t fog_data_size = header.fog_rows * header.fog_cols * sizeof(bool);
-    
-    size_t expected_size_v1 = sizeof(SaveFileHeader) + token_data_size_v1 + fog_data_size;
-    size_t expected_size_v2 = sizeof(SaveFileHeader) + token_data_size_v2 + fog_data_size;
-    size_t expected_size_v3 = sizeof(SaveFileHeader) + token_data_size_v3 + fog_data_size;
-    size_t expected_size_v4 = sizeof(SaveFileHeader) + token_data_size_v4 + fog_data_size;
-    size_t expected_size_v5 = sizeof(SaveFileHeader) + token_data_size_v5 + fog_data_size;
-    
-    // Determine format version (with some tolerance for small discrepancies)
-    int save_version = 1;
-    if (file_size >= (long)expected_size_v5 - 100) {
-        save_version = 5;  // Has conditions
-    } else if (file_size >= (long)expected_size_v4 - 100) {
-        save_version = 4;  // Has damage, squad, and opacity
-    } else if (file_size >= (long)expected_size_v3 - 100) {
-        save_version = 3;  // Has damage and squad
-    } else if (file_size >= (long)expected_size_v2 - 100) {
-        save_version = 2;  // Has damage but no squad
-    }
-    
-    // const char *version_names[] = {"Unknown", "V1", "V2", "V3", "V4", "V5 (conditions)"};
-    //     SDL_Log("Loading save from slot %d... (format: %s)", slot, version_names[save_version]);
-    //     SDL_Log("  File size: %ld bytes, V1: %lu, V2: %lu, V3: %lu, V4: %lu, V5: %lu", file_size, 
-    //         (unsigned long)expected_size_v1, (unsigned long)expected_size_v2, (unsigned long)expected_size_v3, 
-    //         (unsigned long)expected_size_v4, (unsigned long)expected_size_v5);
-    //     SDL_Log("  Map: %s", header.map_path);
-    //     SDL_Log("  Tokens: %u", header.token_count);
-    //     SDL_Log("  Grid: %ux%u (size=%u, offset=%u,%u)", 
-    //         header.fog_cols, header.fog_rows, header.grid_size, 
-    //         header.grid_offset_x, header.grid_offset_y);
-    
-    // Restore grid calibration from save
-    g_grid_calibration.calibrated_size = header.grid_size;
-    g_grid_calibration.calibrated_offset_x = header.grid_offset_x;
-    g_grid_calibration.calibrated_offset_y = header.grid_offset_y;
-    
-    // Clean up existing data
-    map_destroy(map);
-    token_manager_destroy(tokens);
-    fog_destroy(fog);
-    
-    // Load map
-    if (!map_load(map, header.map_path, dm_renderer, player_renderer)) {
-    //         SDL_Log("Failed to load map from save: %s", header.map_path);
-        fclose(f);
-        // Re-initialize empty state
-        map_init(map);
-        token_manager_init(tokens);
-        fog_init(fog, 10, 10);
-        return false;
-    }
-    
-    // Apply saved grid configuration to the loaded map
-    map->grid_size = header.grid_size;
-    map->grid_offset_x = header.grid_offset_x;
-    map->grid_offset_y = header.grid_offset_y;
-    map->grid_cols = (map->width + map->grid_size - 1) / map->grid_size;
-    map->grid_rows = (map->height + map->grid_size - 1) / map->grid_size;
-    
-    // Initialize fog with correct dimensions
-    if (!fog_init(fog, map->grid_cols, map->grid_rows)) {
-    //         SDL_Log("Failed to initialize fog of war");
-        fclose(f);
-        return false;
-    }
-    
-    // Initialize token manager
-    token_manager_init(tokens);
-    
-    // Load tokens based on detected format version
-    for (uint32_t i = 0; i < header.token_count; i++) {
-        char token_filepath[256];
-        int grid_x, grid_y, grid_size;
-        char name[64];
-        bool hidden;
-        int damage = 0;
-        int squad = -1;
-        uint8_t opacity = 255;
-        bool conditions[CONDITION_COUNT];
-        for (int c = 0; c < CONDITION_COUNT; c++) conditions[c] = false;
-        
-        if (fread(token_filepath, 256, 1, f) != 1) {
-    //             SDL_Log("Failed to read token %u filepath", i);
-            break;
-        }
-        if (fread(&grid_x, sizeof(int), 1, f) != 1) {
-    //             SDL_Log("Failed to read token %u grid_x", i);
-            break;
-        }
-        if (fread(&grid_y, sizeof(int), 1, f) != 1) {
-    //             SDL_Log("Failed to read token %u grid_y", i);
-            break;
-        }
-        if (fread(&grid_size, sizeof(int), 1, f) != 1) {
-    //             SDL_Log("Failed to read token %u grid_size", i);
-            break;
-        }
-        if (fread(name, 64, 1, f) != 1) {
-    //             SDL_Log("Failed to read token %u name", i);
-            break;
-        }
-        if (fread(&hidden, sizeof(bool), 1, f) != 1) {
-    //             SDL_Log("Failed to read token %u hidden flag", i);
-            break;
-        }
-        
-        // Read damage if V2 or higher
-        if (save_version >= 2) {
-            if (fread(&damage, sizeof(int), 1, f) != 1) {
-    //                 SDL_Log("Failed to read token %u damage", i);
-                damage = 0;
-            }
-        }
-        
-        // Read squad if V3 or higher
-        if (save_version >= 3) {
-            if (fread(&squad, sizeof(int), 1, f) != 1) {
-    //                 SDL_Log("Failed to read token %u squad", i);
-                squad = -1;
-            }
-        }
-        
-        // Read opacity if V4 or higher
-        if (save_version >= 4) {
-            if (fread(&opacity, sizeof(uint8_t), 1, f) != 1) {
-    //                 SDL_Log("Failed to read token %u opacity", i);
-                opacity = 255;
-            }
-        }
-        
-        // Read conditions if V5
-        if (save_version >= 5) {
-            if (fread(conditions, sizeof(bool), CONDITION_COUNT, f) != CONDITION_COUNT) {
-    //                 SDL_Log("Failed to read token %u conditions", i);
-                for (int c = 0; c < CONDITION_COUNT; c++) conditions[c] = false;
-            }
-        }
-        
-    //         SDL_Log("Token %u: %s at (%d,%d) size=%d hidden=%d damage=%d squad=%d opacity=%u", 
-    //             i, name, grid_x, grid_y, grid_size, hidden, damage, squad, opacity);
-        
-        int token_idx = token_add(tokens, token_filepath, grid_x, grid_y, dm_renderer, player_renderer, name);
-        if (token_idx >= 0) {
-            tokens->tokens[token_idx].grid_size = grid_size;
-            tokens->tokens[token_idx].hidden = hidden;
-            tokens->tokens[token_idx].damage = damage;
-            tokens->tokens[token_idx].squad = squad;
-            tokens->tokens[token_idx].opacity = opacity;
-            for (int c = 0; c < CONDITION_COUNT; c++) {
-                tokens->tokens[token_idx].conditions[c] = conditions[c];
-            }
-        } else {
-    //             SDL_Log("Warning: Failed to add token: %s", token_filepath);
-        }
-    }
-    
-    // Load fog of war data
-    //     SDL_Log("Loading fog of war (%dx%d)...", fog->cols, fog->rows);
-    int fog_read_cols = (fog->cols < (int)header.fog_cols) ? fog->cols : (int)header.fog_cols;
-    int fog_read_rows = (fog->rows < (int)header.fog_rows) ? fog->rows : (int)header.fog_rows;
-    
-    for (int y = 0; y < fog_read_rows; y++) {
-        if (fread(fog->cells[y], sizeof(bool), fog_read_cols, f) != (size_t)fog_read_cols) {
-    //             SDL_Log("Warning: Failed to read fog row %d", y);
-        }
-        // Skip remaining columns in file if map grid is smaller
-        if ((int)header.fog_cols > fog->cols) {
-            fseek(f, (header.fog_cols - fog->cols) * sizeof(bool), SEEK_CUR);
-        }
-    }
-    
-    // Skip remaining rows if map grid is smaller
-    if ((int)header.fog_rows > fog->rows) {
-        fseek(f, (header.fog_rows - fog->rows) * header.fog_cols * sizeof(bool), SEEK_CUR);
-    }
-    
-    // Restore grid visibility state
-    input->show_grid = (header.show_grid != 0);
-    
-    // Restore camera state
-    camera_set_position(camera, header.camera_x, header.camera_y, map->width, map->height);
-    camera->target_zoom = header.camera_zoom;
-    camera->zoom = header.camera_zoom;  // Set immediate zoom too
-    camera_sync(&g_player_camera, camera, map->width, map->height);
-    g_player_camera.zoom = header.camera_zoom;  // Set immediate zoom for player camera
-    
-    fclose(f);
-    //     SDL_Log("Successfully loaded from slot %d", slot);
-    return true;
+static inline void fog_set(int x, int y, bool v) {
+    if (x >= 0 && x < g.fog_w && y >= 0 && y < g.fog_h) g.fog[y*g.fog_w+x] = v;
 }
 
-// ============================================================================
-// UI TEXT RENDERING HELPERS (cached for performance)
-// ============================================================================
-
-// Helper: Create a text texture from string
-SDL_Texture* create_text_texture(SDL_Renderer *renderer, const char *text, float font_size, 
-                                 float *out_width, float *out_height, uint8_t r, uint8_t g, uint8_t b) {
-    if (!g_font_loaded || !text || !text[0]) return NULL;
-    
-    float stb_scale = stbtt_ScaleForPixelHeight(&g_font, font_size);
-    
-    int ascent, descent, line_gap;
-    stbtt_GetFontVMetrics(&g_font, &ascent, &descent, &line_gap);
-    
-    // Calculate dimensions
-    float text_width = 0;
-    for (int i = 0; text[i]; i++) {
-        int advance, left_bearing;
-        stbtt_GetCodepointHMetrics(&g_font, text[i], &advance, &left_bearing);
-        text_width += advance * stb_scale;
-        if (text[i+1]) {
-            text_width += stbtt_GetCodepointKernAdvance(&g_font, text[i], text[i+1]) * stb_scale;
-        }
-    }
-    
-    float text_height = (ascent - descent) * stb_scale;
-    int texture_width = (int)(text_width + 2);
-    int texture_height = (int)(text_height + 2);
-    
-    // Create render target
-    SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888,
-                                             SDL_TEXTUREACCESS_TARGET,
-                                             texture_width, texture_height);
-    if (!texture) return NULL;
-    
-    SDL_SetRenderTarget(renderer, texture);
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
-    SDL_RenderClear(renderer);
-    
-    // Render text
-    float cursor_x = 0;
-    float baseline_y = ascent * stb_scale;
-    
-    for (int i = 0; text[i]; i++) {
-        int advance, left_bearing;
-        stbtt_GetCodepointHMetrics(&g_font, text[i], &advance, &left_bearing);
-        
-        int glyph_width, glyph_height, xoff, yoff;
-        unsigned char *bitmap = stbtt_GetCodepointBitmap(&g_font, 0, stb_scale,
-                                                         text[i], &glyph_width, &glyph_height,
-                                                         &xoff, &yoff);
-        
-        if (bitmap) {
-            SDL_Surface *surface = SDL_CreateSurface(glyph_width, glyph_height, SDL_PIXELFORMAT_RGBA32);
-            if (surface) {
-                uint32_t *pixels = (uint32_t*)surface->pixels;
-                for (int py = 0; py < glyph_height; py++) {
-                    for (int px = 0; px < glyph_width; px++) {
-                        unsigned char alpha = bitmap[py * glyph_width + px];
-                        pixels[py * glyph_width + px] = (alpha << 24) | (b << 16) | (g << 8) | r;
-                    }
-                }
-                
-                SDL_Texture *glyph_tex = SDL_CreateTextureFromSurface(renderer, surface);
-                if (glyph_tex) {
-                    SDL_SetTextureBlendMode(glyph_tex, SDL_BLENDMODE_BLEND);
-                    SDL_FRect dst = {
-                        cursor_x + left_bearing * stb_scale,
-                        baseline_y + yoff,
-                        (float)glyph_width,
-                        (float)glyph_height
-                    };
-                    SDL_RenderTexture(renderer, glyph_tex, NULL, &dst);
-                    SDL_DestroyTexture(glyph_tex);
-                }
-                SDL_DestroySurface(surface);
-            }
-            stbtt_FreeBitmap(bitmap, NULL);
-        }
-        
-        cursor_x += advance * stb_scale;
-        if (text[i+1]) {
-            cursor_x += stbtt_GetCodepointKernAdvance(&g_font, text[i], text[i+1]) * stb_scale;
-        }
-    }
-    
-    SDL_SetRenderTarget(renderer, NULL);
-    SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
-    
-    *out_width = text_width;
-    *out_height = text_height;
-    
-    return texture;
+static void cam_update(Camera *c) {
+    c->x += (c->target_x - c->x) * 0.15f;
+    c->y += (c->target_y - c->y) * 0.15f;
+    c->zoom += (c->target_zoom - c->zoom) * 0.15f;
 }
 
-// Helper function to get 2-letter abbreviation for each condition
-const char* get_condition_abbrev(int condition_index) {
-    switch (condition_index) {
-        case CONDITION_BLEEDING: return "BL";
-        case CONDITION_DAZED: return "DA";
-        case CONDITION_FRIGHTENED: return "FR";
-        case CONDITION_GRABBED: return "GR";
-        case CONDITION_RESTRAINED: return "RE";
-        case CONDITION_SLOWED: return "SL";
-        case CONDITION_TAUNTED: return "TA";
-        case CONDITION_WEAKEND: return "WE";
-        default: return "??";
-    }
+static void cam_zoom(Camera *c, float mx, float my, float f) {
+    float nz = c->target_zoom * f;
+    nz = fmaxf(0.25f, fminf(4.0f, nz));
+    float wx = mx / c->target_zoom + c->target_x;
+    float wy = my / c->target_zoom + c->target_y;
+    c->target_zoom = nz;
+    c->target_x = wx - mx / nz;
+    c->target_y = wy - my / nz;
 }
 
-// ============================================================================
-// CONDITION WHEEL UI
-// ============================================================================
-
-// Wheel size scale factor (adjust this to make wheel bigger/smaller)
-#define CONDITION_WHEEL_SCALE 1.6f
-
-void render_condition_wheel(SDL_Renderer *renderer, const InputState *input, const TokenManager *tokens,
-                            int window_width, int window_height) {
-    if (!input->condition_wheel_open) return;
-    if (input->condition_wheel_token_index < 0 || input->condition_wheel_token_index >= tokens->count) return;
-    
-    const Token *token = &tokens->tokens[input->condition_wheel_token_index];
-    
-    float center_x = window_width / 2.0f;
-    float center_y = window_height / 2.0f;
-    float radius = 150.0f * CONDITION_WHEEL_SCALE;
-    float inner_radius = 50.0f * CONDITION_WHEEL_SCALE;
-    
-    // Get mouse position
-    float mouse_x, mouse_y;
-    SDL_GetMouseState(&mouse_x, &mouse_y);
-    
-    // Calculate which segment is hovered
-    float dx = mouse_x - center_x;
-    float dy = mouse_y - center_y;
-    float dist = sqrtf(dx * dx + dy * dy);
-    float angle = atan2f(dy, dx);
-    if (angle < 0) angle += 2.0f * M_PI;
-    
-    int hovered_index = -1;
-    if (dist >= inner_radius && dist <= radius) {
-        float segment_angle = (2.0f * M_PI) / CONDITION_COUNT;
-        hovered_index = (int)(angle / segment_angle);
-        if (hovered_index >= CONDITION_COUNT) hovered_index = CONDITION_COUNT - 1;
-    }
-    
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    
-    // Draw wheel segments for ALL conditions (active ones grayed out)
-    for (int i = 0; i < CONDITION_COUNT; i++) {
-        const ConditionInfo *info = &CONDITION_INFO[i];
-        bool is_active = token->conditions[i];
-        
-        float start_angle = (2.0f * M_PI * i) / CONDITION_COUNT;
-        float end_angle = (2.0f * M_PI * (i + 1)) / CONDITION_COUNT;
-        
-        // Convert colors from 0-255 to 0.0-1.0 for SDL3
-        float r, g, b, alpha;
-        
-        if (is_active) {
-            // Gray out active conditions (desaturate to gray)
-            float gray = (info->r * 0.3f + info->g * 0.59f + info->b * 0.11f) / 255.0f;
-            r = g = b = gray * 0.5f;  // Darker gray
-            alpha = (i == hovered_index) ? 0.9f : 0.7f;
-        } else {
-            // Full color for inactive conditions
-            r = info->r / 255.0f;
-            g = info->g / 255.0f;
-            b = info->b / 255.0f;
-            alpha = (i == hovered_index) ? 1.0f : 0.85f;
-        }
-        
-        int steps = 30;
-        for (int step = 0; step < steps; step++) {
-            float a1 = start_angle + (end_angle - start_angle) * step / steps;
-            float a2 = start_angle + (end_angle - start_angle) * (step + 1) / steps;
-            
-            float x1_inner = center_x + inner_radius * cosf(a1);
-            float y1_inner = center_y + inner_radius * sinf(a1);
-            float x1_outer = center_x + radius * cosf(a1);
-            float y1_outer = center_y + radius * sinf(a1);
-            
-            float x2_inner = center_x + inner_radius * cosf(a2);
-            float y2_inner = center_y + inner_radius * sinf(a2);
-            float x2_outer = center_x + radius * cosf(a2);
-            float y2_outer = center_y + radius * sinf(a2);
-            
-            // Use SDL_Vertex with properly normalized colors (0.0-1.0)
-            SDL_Vertex vertices[4] = {
-                {{x1_inner, y1_inner}, {r, g, b, alpha}, {0, 0}},
-                {{x1_outer, y1_outer}, {r, g, b, alpha}, {0, 0}},
-                {{x2_outer, y2_outer}, {r, g, b, alpha}, {0, 0}},
-                {{x2_inner, y2_inner}, {r, g, b, alpha}, {0, 0}}
-            };
-            
-            int indices[6] = {0, 1, 2, 0, 2, 3};
-            SDL_RenderGeometry(renderer, NULL, vertices, 4, indices, 6);
-        }
-        
-        // Draw border lines with more contrast when hovered
-        SDL_SetRenderDrawColor(renderer, 255, 255, 255, i == hovered_index ? 255 : 180);
-        float line_angle_start = start_angle;
-        SDL_RenderLine(renderer, 
-                       center_x + inner_radius * cosf(line_angle_start),
-                       center_y + inner_radius * sinf(line_angle_start),
-                       center_x + radius * cosf(line_angle_start),
-                       center_y + radius * sinf(line_angle_start));
-    }
-    
-    // Draw center circle using scanline algorithm
-    SDL_SetRenderDrawColor(renderer, 40, 40, 60, 240);
-    int r = (int)inner_radius;
-    for (int y = -r; y <= r; y++) {
-        int half_width = (int)sqrtf(inner_radius * inner_radius - y * y);
-        if (half_width > 0) {
-            SDL_FRect line = {center_x - half_width, center_y + y, half_width * 2, 1};
-            SDL_RenderFillRect(renderer, &line);
-        }
-    }
-    
-    // Initialize condition text cache if needed
-    if (g_font_loaded && !g_condition_wheel_cache_initialized) {
-        float font_size = 14.0f * CONDITION_WHEEL_SCALE;
-        for (int i = 0; i < CONDITION_COUNT; i++) {
-            const char *condition_name = CONDITION_INFO[i].name;
-            g_condition_wheel_text_cache[i].texture = create_text_texture(
-                renderer, condition_name, font_size, 
-                &g_condition_wheel_text_cache[i].width,
-                &g_condition_wheel_text_cache[i].height,
-                255, 255, 255
-            );
-            strncpy(g_condition_wheel_text_cache[i].cached_text, condition_name, 
-                    sizeof(g_condition_wheel_text_cache[i].cached_text) - 1);
-        }
-        g_condition_wheel_cache_initialized = true;
-    }
-    
-    // Draw condition names (using cached textures) - ALL conditions
-    if (g_font_loaded && g_condition_wheel_cache_initialized) {
-        for (int i = 0; i < CONDITION_COUNT; i++) {
-            bool is_active = token->conditions[i];
-            
-            float mid_angle = (2.0f * M_PI * (i + 0.5f)) / CONDITION_COUNT;
-            float text_radius = (radius + inner_radius) / 2.0f;
-            float text_x = center_x + text_radius * cosf(mid_angle);
-            float text_y = center_y + text_radius * sinf(mid_angle);
-            
-            const ConditionInfo *info = &CONDITION_INFO[i];
-            SDL_Texture *text_tex = g_condition_wheel_text_cache[i].texture;
-            float text_w = g_condition_wheel_text_cache[i].width;
-            float text_h = g_condition_wheel_text_cache[i].height;
-            
-            if (text_tex) {
-                // Draw colored background for the text
-                float padding = 4.0f * CONDITION_WHEEL_SCALE;
-                SDL_FRect text_bg = {text_x - text_w/2 - padding, text_y - text_h/2 - padding, text_w + padding*2, text_h + padding*2};
-                
-                if (is_active) {
-                    // Gray background for active conditions
-                    uint8_t gray = (uint8_t)(info->r * 0.3f + info->g * 0.59f + info->b * 0.11f) / 2;
-                    SDL_SetRenderDrawColor(renderer, gray, gray, gray, 200);
-                } else {
-                    // Full color background for inactive conditions
-                    SDL_SetRenderDrawColor(renderer, info->r, info->g, info->b, 240);
-                }
-                SDL_RenderFillRect(renderer, &text_bg);
-                
-                // Draw border - thicker if hovered
-                SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-                SDL_RenderRect(renderer, &text_bg);
-                if (i == hovered_index) {
-                    SDL_FRect text_bg_outer = {text_bg.x - 1, text_bg.y - 1, text_bg.w + 2, text_bg.h + 2};
-                    SDL_RenderRect(renderer, &text_bg_outer);
-                    SDL_FRect text_bg_outer2 = {text_bg.x - 2, text_bg.y - 2, text_bg.w + 4, text_bg.h + 4};
-                    SDL_RenderRect(renderer, &text_bg_outer2);
-                }
-                
-                // Render the cached text (dimmer if active)
-                SDL_SetTextureAlphaMod(text_tex, is_active ? 150 : 255);
-                SDL_FRect text_dst = {text_x - text_w/2, text_y - text_h/2, text_w, text_h};
-                SDL_RenderTexture(renderer, text_tex, NULL, &text_dst);
-                SDL_SetTextureAlphaMod(text_tex, 255);  // Reset alpha
-            }
-        }
-    }
-    
-    // Draw instructions
-    if (g_font_loaded) {
-        static SDL_Texture *help_tex = NULL;
-        static float help_w = 0, help_h = 0;
-        const char *help = "Click to toggle condition (Gray = Active) | ESC to close";
-        
-        if (!help_tex) {
-            help_tex = create_text_texture(renderer, help, 16.0f * CONDITION_WHEEL_SCALE, &help_w, &help_h, 255, 255, 255);
-        }
-        
-        if (help_tex) {
-            SDL_FRect help_dst = {center_x - help_w/2, center_y + radius + 20 * CONDITION_WHEEL_SCALE, help_w, help_h};
-            SDL_RenderTexture(renderer, help_tex, NULL, &help_dst);
-        }
-    }
+static void screen_to_grid(float sx, float sy, const Camera *c, int *gx, int *gy) {
+    int wx = (int)(sx / c->zoom + c->x);
+    int wy = (int)(sy / c->zoom + c->y);
+    *gx = (wx - g.grid_off_x) / g.grid_size;
+    *gy = (wy - g.grid_off_y) / g.grid_size;
 }
 
-void render_token_conditions(SDL_Renderer *renderer, const Token *token, float x, float y, float scale) {
-    // Count active conditions
-    int active_count = 0;
-    for (int i = 0; i < CONDITION_COUNT; i++) {
-        if (token->conditions[i]) active_count++;
-    }
-    
-    if (active_count == 0) return;
-    if (!g_font_loaded) return;
-
-    // Render 2-letter abbreviations stacked vertically at the bottom left of the token, growing up
-    float font_size = 16.0f * scale;
-    float padding = 4 * scale;
-    float tag_width = 24.0f * scale;
-    float tag_height = 18.0f * scale;
-    float tag_x = x - (token->width * scale) / 2 + (tag_width * 0.6f);
-    float tag_y = y - tag_height - padding;
-    
-    int tag_index = 0;
-    for (int i = 0; i < CONDITION_COUNT; i++) {
-        if (token->conditions[i]) {
-            const ConditionInfo *info = &CONDITION_INFO[i];
-            const char *abbrev = get_condition_abbrev(i);
-
-            // Render the abbreviation with a colored background
-            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-            SDL_FRect tag_bg = {tag_x - padding, tag_y - padding, tag_width + padding*2, tag_height + padding*2};
-            SDL_SetRenderDrawColor(renderer, info->r, info->g, info->b, 220);
-            SDL_RenderFillRect(renderer, &tag_bg);
-
-            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-            SDL_RenderRect(renderer, &tag_bg);
-
-            // Render the abbreviation text
-            float text_w, text_h;
-            SDL_Texture *text_tex = create_text_texture(renderer, abbrev, font_size, &text_w, &text_h, 255, 255, 255);
-            if (text_tex) {
-                SDL_FRect text_dst = {tag_x + (tag_width - text_w) / 2, tag_y + (tag_height - text_h) / 2, text_w, text_h};
-                SDL_RenderTexture(renderer, text_tex, NULL, &text_dst);
-                SDL_DestroyTexture(text_tex);
-            }
-
-            tag_index++;
-            
-            // Move to next position AFTER drawing (so next tag stacks upward)
-            tag_y -= (tag_height + padding * 2);
-            
-            // If we have too many conditions, stop
-            if (tag_index >= 6) break;
+static void render_circle(SDL_Renderer *r, float cx, float cy, float rad, bool fill, SDL_Color col) {
+    SDL_SetRenderDrawColor(r, col.r, col.g, col.b, col.a);
+    if (fill) {
+        int ir = (int)rad;
+        for (int y = -ir; y <= ir; y++) {
+            int hw = (int)sqrtf(rad*rad - y*y);
+            if (hw > 0) SDL_RenderFillRect(r, &(SDL_FRect){cx-hw, cy+y, hw*2, 1});
         }
-    }
-}
-
-// ============================================================================
-// SQUAD MODE UI (with texture caching)
-// ============================================================================
-
-void render_squad_mode_ui(SDL_Renderer *renderer, const InputState *input, int window_width, int window_height) {
-    (void)window_height;  // Unused parameter
-    if (input->current_tool != TOOL_SQUAD || !g_font_loaded) return;
-    
-    const SquadColor *current_color = &SQUAD_COLORS[input->current_squad];
-    
-    // Create display text
-    char display_text[128];
-    snprintf(display_text, sizeof(display_text), "Squad Mode: %s", current_color->name);
-    
-    // Check if we need to regenerate the cached texture
-    if (g_squad_mode_cache.texture == NULL || 
-        strcmp(g_squad_mode_cache.cached_text, display_text) != 0 ||
-        g_squad_mode_cache.cached_value != input->current_squad) {
-        
-        // Destroy old texture
-        if (g_squad_mode_cache.texture) {
-            SDL_DestroyTexture(g_squad_mode_cache.texture);
-        }
-        
-        // Create new texture
-        g_squad_mode_cache.texture = create_text_texture(renderer, display_text, 24.0f,
-                                                         &g_squad_mode_cache.width,
-                                                         &g_squad_mode_cache.height,
-                                                         255, 255, 255);
-        strncpy(g_squad_mode_cache.cached_text, display_text, sizeof(g_squad_mode_cache.cached_text) - 1);
-        g_squad_mode_cache.cached_value = input->current_squad;
-    }
-    
-    if (!g_squad_mode_cache.texture) return;
-    
-    // Calculate layout
-    float padding = 12.0f;
-    float color_box_size = g_squad_mode_cache.height;
-    float spacing = 10.0f;
-    float bg_width = g_squad_mode_cache.width + color_box_size + spacing + padding * 3;
-    float bg_height = g_squad_mode_cache.height + padding * 2;
-    
-    SDL_FRect bg_rect = {
-        (window_width - bg_width) / 2,
-        20,
-        bg_width,
-        bg_height
-    };
-    
-    // Draw background
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer, 40, 40, 60, 240);
-    SDL_RenderFillRect(renderer, &bg_rect);
-    
-    // Draw border
-    SDL_SetRenderDrawColor(renderer, current_color->r, current_color->g, current_color->b, 255);
-    SDL_FRect borders[3] = {
-        {bg_rect.x, bg_rect.y, bg_rect.w, bg_rect.h},
-        {bg_rect.x - 1, bg_rect.y - 1, bg_rect.w + 2, bg_rect.h + 2},
-        {bg_rect.x - 2, bg_rect.y - 2, bg_rect.w + 4, bg_rect.h + 4}
-    };
-    SDL_RenderRects(renderer, borders, 3);
-    
-    // Draw color indicator box
-    SDL_FRect color_box = {bg_rect.x + padding, bg_rect.y + padding, color_box_size, color_box_size};
-    SDL_SetRenderDrawColor(renderer, current_color->r, current_color->g, current_color->b, 255);
-    SDL_RenderFillRect(renderer, &color_box);
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    SDL_RenderRect(renderer, &color_box);
-    
-    // Render cached text texture
-    SDL_FRect text_dst = {
-        bg_rect.x + padding + color_box_size + spacing,
-        bg_rect.y + padding,
-        g_squad_mode_cache.width,
-        g_squad_mode_cache.height
-    };
-    SDL_RenderTexture(renderer, g_squad_mode_cache.texture, NULL, &text_dst);
-    
-    // Help text (simplified - no per-frame regeneration)
-    const char *help = "Q/E=Cycle | Click=Assign | Click Again=Remove";
-    static SDL_Texture *help_tex = NULL;
-    static float help_w = 0, help_h = 0;
-    
-    if (!help_tex) {
-        help_tex = create_text_texture(renderer, help, 14.0f, &help_w, &help_h, 238, 238, 238);
-    }
-    
-    if (help_tex) {
-        SDL_FRect help_dst = {bg_rect.x, bg_rect.y + bg_rect.h + 8, help_w, help_h};
-        SDL_RenderTexture(renderer, help_tex, NULL, &help_dst);
-    }
-}
-
-// ============================================================================
-// DRAW MODE UI (with texture caching)
-// ============================================================================
-
-void render_draw_mode_ui(SDL_Renderer *renderer, const InputState *input, int window_width, int window_height) {
-    if (input->current_tool != TOOL_DRAW || !g_font_loaded) return;
-    (void)window_height;  // Unused parameter
-    
-    const SquadColor *current_color = &SQUAD_COLORS[input->current_squad];
-    const char *shape_name = (input->current_shape == SHAPE_RECTANGLE) ? "Rectangle" : "Circle";
-    
-    char display_text[128];
-    snprintf(display_text, sizeof(display_text), "Draw Mode: %s - %s", current_color->name, shape_name);
-    
-    // Check if we need to regenerate cached texture
-    static SDL_Texture *draw_ui_tex = NULL;
-    static char cached_text[128] = "";
-    static int cached_color = -1;
-    static float cached_w = 0, cached_h = 0;
-    
-    if (!draw_ui_tex || strcmp(cached_text, display_text) != 0 || cached_color != input->current_squad) {
-        if (draw_ui_tex) SDL_DestroyTexture(draw_ui_tex);
-        draw_ui_tex = create_text_texture(renderer, display_text, 24.0f, &cached_w, &cached_h, 255, 255, 255);
-        strncpy(cached_text, display_text, sizeof(cached_text) - 1);
-        cached_color = input->current_squad;
-    }
-    
-    if (!draw_ui_tex) return;
-    
-    float padding = 12.0f;
-    float color_box_size = cached_h;
-    float spacing = 10.0f;
-    float bg_width = cached_w + color_box_size + spacing + padding * 3;
-    float bg_height = cached_h + padding * 2;
-    
-    SDL_FRect bg_rect = {
-        (window_width - bg_width) / 2,
-        20,
-        bg_width,
-        bg_height
-    };
-    
-    // Draw background
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer, 40, 40, 60, 240);
-    SDL_RenderFillRect(renderer, &bg_rect);
-    
-    // Draw border with current color
-    SDL_SetRenderDrawColor(renderer, current_color->r, current_color->g, current_color->b, 255);
-    SDL_FRect borders[3] = {
-        {bg_rect.x, bg_rect.y, bg_rect.w, bg_rect.h},
-        {bg_rect.x - 1, bg_rect.y - 1, bg_rect.w + 2, bg_rect.h + 2},
-        {bg_rect.x - 2, bg_rect.y - 2, bg_rect.w + 4, bg_rect.h + 4}
-    };
-    SDL_RenderRects(renderer, borders, 3);
-    
-    // Draw color indicator box
-    SDL_FRect color_box = {bg_rect.x + padding, bg_rect.y + padding, color_box_size, color_box_size};
-    SDL_SetRenderDrawColor(renderer, current_color->r, current_color->g, current_color->b, 255);
-    SDL_RenderFillRect(renderer, &color_box);
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    SDL_RenderRect(renderer, &color_box);
-    
-    // Render text
-    SDL_FRect text_dst = {
-        bg_rect.x + padding + color_box_size + spacing,
-        bg_rect.y + padding,
-        cached_w,
-        cached_h
-    };
-    SDL_RenderTexture(renderer, draw_ui_tex, NULL, &text_dst);
-    
-    // Help text
-    static SDL_Texture *help_tex = NULL;
-    static float help_w = 0, help_h = 0;
-    const char *help = "Q/E=Color | W=Cycle Shape | Right Click=Delete | X=Clear All";
-    
-    if (!help_tex) {
-        help_tex = create_text_texture(renderer, help, 14.0f, &help_w, &help_h, 238, 238, 238);
-    }
-    
-    if (help_tex) {
-        SDL_FRect help_dst = {bg_rect.x, bg_rect.y + bg_rect.h + 8, help_w, help_h};
-        SDL_RenderTexture(renderer, help_tex, NULL, &help_dst);
-    }
-}
-
-// Render current drawing preview
-void render_drawing_preview(SDL_Renderer *renderer, const InputState *input,
-                            float camera_x, float camera_y, float zoom) {
-    if (!input->drawing_shape) return;
-    
-    const SquadColor *color = &SQUAD_COLORS[input->current_squad];
-    
-    float mouse_x, mouse_y;
-    SDL_GetMouseState(&mouse_x, &mouse_y);
-    
-    int world_x = (int)(mouse_x / zoom + camera_x);
-    int world_y = (int)(mouse_y / zoom + camera_y);
-    
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer, color->r, color->g, color->b, 100);
-    
-    if (input->current_shape == SHAPE_RECTANGLE) {
-        SDL_FRect rect = {
-            (input->draw_start_x - camera_x) * zoom,
-            (input->draw_start_y - camera_y) * zoom,
-            (world_x - input->draw_start_x) * zoom,
-            (world_y - input->draw_start_y) * zoom
-        };
-        
-        // Normalize
-        if (rect.w < 0) {
-            rect.x += rect.w;
-            rect.w = -rect.w;
-        }
-        if (rect.h < 0) {
-            rect.y += rect.h;
-            rect.h = -rect.h;
-        }
-        
-        SDL_RenderFillRect(renderer, &rect);
-        SDL_SetRenderDrawColor(renderer, color->r, color->g, color->b, 255);
-        SDL_RenderRect(renderer, &rect);
     } else {
-        // Circle preview with optimized rendering
-        float cx = ((input->draw_start_x + world_x) / 2.0f - camera_x) * zoom;
-        float cy = ((input->draw_start_y + world_y) / 2.0f - camera_y) * zoom;
-        float radius = sqrtf(powf((world_x - input->draw_start_x) * zoom, 2) + 
-                             powf((world_y - input->draw_start_y) * zoom, 2)) / 2.0f;
-        
-        render_filled_circle(renderer, cx, cy, radius);
-        
-        // Draw border
-        SDL_SetRenderDrawColor(renderer, color->r, color->g, color->b, 255);
-        int r = (int)radius;
-        int x = 0;
-        int y = r;
-        int d = 3 - 2 * r;
-        
+        int x = 0, y = (int)rad, d = 3 - 2*(int)rad;
         while (y >= x) {
-            SDL_RenderPoint(renderer, cx + x, cy + y);
-            SDL_RenderPoint(renderer, cx - x, cy + y);
-            SDL_RenderPoint(renderer, cx + x, cy - y);
-            SDL_RenderPoint(renderer, cx - x, cy - y);
-            SDL_RenderPoint(renderer, cx + y, cy + x);
-            SDL_RenderPoint(renderer, cx - y, cy + x);
-            SDL_RenderPoint(renderer, cx + y, cy - x);
-            SDL_RenderPoint(renderer, cx - y, cy - x);
+            SDL_RenderPoint(r, cx+x, cy+y); SDL_RenderPoint(r, cx-x, cy+y);
+            SDL_RenderPoint(r, cx+x, cy-y); SDL_RenderPoint(r, cx-x, cy-y);
+            SDL_RenderPoint(r, cx+y, cy+x); SDL_RenderPoint(r, cx-y, cy+x);
+            SDL_RenderPoint(r, cx+y, cy-x); SDL_RenderPoint(r, cx-y, cy-x);
+            x++; d += (d > 0) ? 4*(x-y)+10 : 4*x+6;
+            if (d > 0) y--;
+        }
+    }
+}
+
+static void render_token(SDL_Renderer *r, Token *t, const Camera *c, int view) {
+    if (t->hidden && view == 1) return;
+    int gx = t->grid_x * g.grid_size + g.grid_off_x;
+    int gy = t->grid_y * g.grid_size + g.grid_off_y;
+    Asset *img = &g.token_lib[t->image_idx];
+    ensure_asset_loaded(img);
+    if (!img->tex[view]) return;
+    float scale = (g.grid_size * t->size) / (float)img->w * c->zoom;
+    float sw = img->w * scale, sh = img->h * scale;
+    float sx = (gx - c->x) * c->zoom;
+    float sy = (gy - c->y) * c->zoom - (sh - g.grid_size * c->zoom);
+    
+    if (t->squad >= 0) {
+        static const SDL_Color squad_cols[8] = {
+            {255,50,50,255},{50,150,255,255},{50,255,50,255},{255,255,50,255},
+            {255,150,50,255},{200,50,255,255},{50,255,255,255},{255,255,255,255}
+        };
+        SDL_Color col = squad_cols[t->squad % 8];
+        float thick = 3 * c->zoom;
+        SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 255);
+        SDL_FRect rects[4] = {
+            {sx-thick, sy-thick, sw+2*thick, thick},
+            {sx-thick, sy+sh, sw+2*thick, thick},
+            {sx-thick, sy, thick, sh},
+            {sx+sw, sy, thick, sh}
+        };
+        SDL_RenderFillRects(r, rects, 4);
+    }
+    
+    SDL_SetTextureAlphaMod(img->tex[view], t->hidden ? 128 : t->opacity);
+    SDL_RenderTexture(r, img->tex[view], NULL, &(SDL_FRect){sx, sy, sw, sh});
+    SDL_SetTextureAlphaMod(img->tex[view], 255);
+    
+    if (t->selected && view == 0) {
+        SDL_SetRenderDrawColor(r, 255, 255, 0, 255);
+        SDL_RenderRect(r, &(SDL_FRect){sx, sy, sw, sh});
+    }
+    
+    if (t->damage > 0) {
+        if (!t->damage_tex[view] || t->cached_dmg[view] != t->damage) {
+            if (t->damage_tex[view]) SDL_DestroyTexture(t->damage_tex[view]);
+            char buf[16]; snprintf(buf, 16, "%d", t->damage);
+            SDL_Color white = {255, 255, 255, 255};
+            int w, h;
+            t->damage_tex[view] = bake_text_once(r, buf, &w, &h, white, 16.0f);
+            t->cached_dmg[view] = t->damage;
+        }
+        if (t->damage_tex[view]) {
+            float w, h; SDL_GetTextureSize(t->damage_tex[view], &w, &h);
+            SDL_SetRenderDrawColor(r, 200, 0, 0, 230);
+            SDL_RenderFillRect(r, &(SDL_FRect){sx + sw/2 - w/2 - 2, sy - h - 4, w + 4, h + 4});
+            SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+            SDL_RenderRect(r, &(SDL_FRect){sx + sw/2 - w/2 - 2, sy - h - 4, w + 4, h + 4});
+            SDL_RenderTexture(r, t->damage_tex[view], NULL, &(SDL_FRect){sx + sw/2 - w/2, sy - h - 2, w, h});
+        }
+    }
+    
+    // Render conditions stacked vertically upward on the left side
+    // Tag size scales with token size AND camera zoom (in screen space)
+    float token_scale = t->size;  // 1-4 based on token grid size
+    
+    static const SDL_Color cond_colors[COND_COUNT] = {
+        {220,20,20,255}, {255,215,0,255}, {147,51,234,255}, {255,140,0,255},
+        {139,69,19,255}, {30,144,255,255}, {255,20,147,255}, {50,205,50,255}
+    };
+    
+    // Scale everything by both token size and camera zoom for proper screen space rendering
+    float padding = 4.0f * token_scale * c->zoom;
+    float tag_width = 24.0f * token_scale * c->zoom;
+    float tag_height = 18.0f * token_scale * c->zoom;
+    
+    // Position tags at bottom-left of token, growing upward
+    float tag_x = sx - sw/2 + tag_width * 0.6f;
+    float tag_y = sy + sh - tag_height - padding;
+    
+    for (int i = 0; i < COND_COUNT; i++) {
+        if (!t->cond[i]) continue;
+        
+        SDL_Color col = cond_colors[i];
+        
+        // Background with condition color
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_FRect tag_bg = {tag_x - padding, tag_y - padding, tag_width + padding*2, tag_height + padding*2};
+        SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 220);
+        SDL_RenderFillRect(r, &tag_bg);
+        
+        // Border
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        SDL_RenderRect(r, &tag_bg);
+        
+        // Text - scale by both token size and camera zoom
+        if (g.cond_tex[view][i]) {
+            float text_w = g.cond_w * token_scale * c->zoom;
+            float text_h = g.cond_h * token_scale * c->zoom;
+            SDL_FRect text_dst = {tag_x + (tag_width - text_w) / 2, tag_y + (tag_height - text_h) / 2, text_w, text_h};
+            SDL_RenderTexture(r, g.cond_tex[view][i], NULL, &text_dst);
+        }
+        
+        // Move up for next tag
+        tag_y -= tag_height + padding * 2;
+    }
+}
+
+static void render_view(int view) {
+    Window *win = view == 0 ? &g.dm : &g.player;
+    SDL_Renderer *r = win->ren;
+    Camera *c = &g.cam[view];
+    SDL_GetWindowSize(win->win, &win->w, &win->h);
+    
+    SDL_SetRenderDrawColor(r, 20, 20, 20, 255);
+    SDL_RenderClear(r);
+    
+    if (g.map_current < g.map_count) {
+        Asset *m = &g.map_assets[g.map_current];
+        ensure_asset_loaded(m);
+        if (m->tex[view]) {
+            SDL_RenderTexture(r, m->tex[view], NULL, &(SDL_FRect){-c->x*c->zoom, -c->y*c->zoom, m->w*c->zoom, m->h*c->zoom});
+        }
+    }
+    
+    if (view == 0 && g.show_grid) {
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r, 100, 100, 100, 100);
+        int sc = (c->x - g.grid_off_x) / g.grid_size;
+        int ec = ((c->x + win->w/c->zoom) - g.grid_off_x) / g.grid_size + 1;
+        int sr = (c->y - g.grid_off_y) / g.grid_size;
+        int er = ((c->y + win->h/c->zoom) - g.grid_off_y) / g.grid_size + 1;
+        for (int x = sc; x <= ec; x++) {
+            float px = (x * g.grid_size + g.grid_off_x - c->x) * c->zoom;
+            SDL_RenderLine(r, px, 0, px, win->h);
+        }
+        for (int y = sr; y <= er; y++) {
+            float py = (y * g.grid_size + g.grid_off_y - c->y) * c->zoom;
+            SDL_RenderLine(r, 0, py, win->w, py);
+        }
+    }
+    
+    for (int i = 0; i < g.token_count; i++) {
+        if (view == 1 && !fog_get(g.tokens[i].grid_x, g.tokens[i].grid_y)) continue;
+        render_token(r, &g.tokens[i], c, view);
+    }
+    
+    static const SDL_Color cols[8] = {
+        {255,50,50,128},{50,150,255,128},{50,255,50,128},{255,255,50,128},
+        {255,150,50,128},{200,50,255,128},{50,255,255,128},{255,255,255,128}
+    };
+    for (int i = 0; i < g.drawing_count; i++) {
+        Drawing *d = &g.drawings[i];
+        SDL_Color col = cols[d->color % 8];
+        float x1 = (d->x1 - c->x) * c->zoom, y1 = (d->y1 - c->y) * c->zoom;
+        float x2 = (d->x2 - c->x) * c->zoom, y2 = (d->y2 - c->y) * c->zoom;
+        if (d->type == SHAPE_RECT) {
+            SDL_FRect rect = {x1, y1, x2-x1, y2-y1};
+            if (rect.w < 0) { rect.x += rect.w; rect.w = -rect.w; }
+            if (rect.h < 0) { rect.y += rect.h; rect.h = -rect.h; }
+            SDL_SetRenderDrawColor(r, col.r, col.g, col.b, col.a);
+            SDL_RenderFillRect(r, &rect);
+            SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 255);
+            SDL_RenderRect(r, &rect);
+        } else {
+            float rad = sqrtf((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1))/2;
+            render_circle(r, (x1+x2)/2, (y1+y2)/2, rad, true, col);
+            SDL_Color b = {col.r, col.g, col.b, 255};
+            render_circle(r, (x1+x2)/2, (y1+y2)/2, rad, false, b);
+        }
+    }
+    
+    if (view == 0 && g.draw_shape) {
+        float mx, my;
+        SDL_GetMouseState(&mx, &my);
+        int wx = (int)(mx/c->zoom + c->x);
+        int wy = (int)(my/c->zoom + c->y);
+        SDL_Color col = cols[g.current_squad % 8];
+        col.a = 100;
+        float x1 = (g.paint_start_x - c->x) * c->zoom, y1 = (g.paint_start_y - c->y) * c->zoom;
+        float x2 = (wx - c->x) * c->zoom, y2 = (wy - c->y) * c->zoom;
+        if (g.current_shape == SHAPE_RECT) {
+            SDL_FRect rect = {x1, y1, x2-x1, y2-y1};
+            if (rect.w < 0) { rect.x += rect.w; rect.w = -rect.w; }
+            if (rect.h < 0) { rect.y += rect.h; rect.h = -rect.h; }
+            SDL_SetRenderDrawColor(r, col.r, col.g, col.b, col.a);
+            SDL_RenderFillRect(r, &rect);
+            SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 255);
+            SDL_RenderRect(r, &rect);
+        } else {
+            float rad = sqrtf((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1))/2;
+            render_circle(r, (x1+x2)/2, (y1+y2)/2, rad, true, col);
+            SDL_Color b = {col.r, col.g, col.b, 255};
+            render_circle(r, (x1+x2)/2, (y1+y2)/2, rad, false, b);
+        }
+    }
+    
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, view == 0 ? 180 : 255);
+    int sc = (c->x - g.grid_off_x) / g.grid_size;
+    int ec = ((c->x + win->w/c->zoom) - g.grid_off_x) / g.grid_size + 1;
+    int sr = (c->y - g.grid_off_y) / g.grid_size;
+    int er = ((c->y + win->h/c->zoom) - g.grid_off_y) / g.grid_size + 1;
+    if (sc < 0) sc = 0;
+    if (sr < 0) sr = 0;
+    if (ec > g.fog_w) ec = g.fog_w;
+    if (er > g.fog_h) er = g.fog_h;
+    for (int y = sr; y < er; y++) {
+        for (int x = sc; x < ec; x++) {
+            if (!g.fog[y*g.fog_w+x]) {
+                SDL_FRect cell = {
+                    (x*g.grid_size + g.grid_off_x - c->x)*c->zoom,
+                    (y*g.grid_size + g.grid_off_y - c->y)*c->zoom,
+                    g.grid_size*c->zoom, g.grid_size*c->zoom
+                };
+                SDL_RenderFillRect(r, &cell);
+            }
+        }
+    }
+    
+    if (view == 0 && g.cal_active && g.cal_drag) {
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r, 0, 100, 255, 80);
+        float x = (fmin(g.cal_x1, g.cal_x2) - c->x)*c->zoom;
+        float y = (fmin(g.cal_y1, g.cal_y2) - c->y)*c->zoom;
+        float w = abs(g.cal_x2 - g.cal_x1)*c->zoom;
+        float h = abs(g.cal_y2 - g.cal_y1)*c->zoom;
+        SDL_RenderFillRect(r, &(SDL_FRect){x, y, w, h});
+        SDL_SetRenderDrawColor(r, 0, 150, 255, 180);
+        float cw = w/g.cal_cells_w, ch = h/g.cal_cells_h;
+        for (int i = 1; i < g.cal_cells_w; i++) SDL_RenderLine(r, x+i*cw, y, x+i*cw, y+h);
+        for (int i = 1; i < g.cal_cells_h; i++) SDL_RenderLine(r, x, y+i*ch, x+w, y+i*ch);
+        SDL_RenderRect(r, &(SDL_FRect){x, y, w, h});
+    }
+    
+    if (view == 0 && g.font_data) {
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        
+        const char *tool_names[] = {"SELECT TOOL", "FOG OF WAR", "SQUAD ASSIGN", "DRAWING"};
+        if (g.cached_tool != g.tool) {
+            g.cached_tool = g.tool;
+            update_cached_text(&g.ui_tool, r, tool_names[g.tool], (SDL_Color){255,255,255,255});
+        }
+        if (g.ui_tool.tex) {
+            SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
+            SDL_RenderFillRect(r, &(SDL_FRect){10, 10, g.ui_tool.w + 40, g.ui_tool.h + 20});
+            SDL_SetRenderDrawColor(r, 100, 100, 150, 255);
+            SDL_RenderRect(r, &(SDL_FRect){10, 10, g.ui_tool.w + 40, g.ui_tool.h + 20});
+            SDL_RenderTexture(r, g.ui_tool.tex, NULL, &(SDL_FRect){20, 20, g.ui_tool.w, g.ui_tool.h});
+        }
+        
+        if (g.tool == TOOL_SQUAD || g.tool == TOOL_DRAW) {
+            char buf[64];
+            const char *type = g.tool == TOOL_SQUAD ? "SQUAD" : "DRAW";
+            snprintf(buf, 64, "%s: Color %d", type, g.current_squad);
+            update_cached_text(&g.ui_squad, r, buf, (SDL_Color){255,255,255,255});
+            if (g.ui_squad.tex) {
+                int y = 50;
+                SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
+                SDL_RenderFillRect(r, &(SDL_FRect){10, y, g.ui_squad.w + 60, g.ui_squad.h + 20});
+                static const SDL_Color squad_cols[8] = {
+                    {255,50,50,255},{50,150,255,255},{50,255,50,255},{255,255,50,255},
+                    {255,150,50,255},{200,50,255,255},{50,255,255,255},{255,255,255,255}
+                };
+                SDL_Color col = squad_cols[g.current_squad % 8];
+                SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 255);
+                SDL_RenderFillRect(r, &(SDL_FRect){20, y+10, 20, 20});
+                SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+                SDL_RenderRect(r, &(SDL_FRect){20, y+10, 20, 20});
+                SDL_RenderTexture(r, g.ui_squad.tex, NULL, &(SDL_FRect){50, y+10, g.ui_squad.w, g.ui_squad.h});
+            }
+        }
+        
+        if (g.dmg_input) {
+            char buf[32]; snprintf(buf, 32, "%s: %s_", g.shift ? "HEAL" : "DAMAGE", g.dmg_buf);
+            update_cached_text(&g.ui_dmg, r, buf, g.shift ? (SDL_Color){100,255,100,255} : (SDL_Color){255,100,100,255});
+            if (g.ui_dmg.tex) {
+                int x = win->w/2 - (g.ui_dmg.w + 40)/2;
+                SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
+                SDL_RenderFillRect(r, &(SDL_FRect){x, 20, g.ui_dmg.w + 40, g.ui_dmg.h + 20});
+                SDL_SetRenderDrawColor(r, g.shift ? 100 : 200, g.shift ? 200 : 100, 100, 255);
+                SDL_RenderRect(r, &(SDL_FRect){x, 20, g.ui_dmg.w + 40, g.ui_dmg.h + 20});
+                SDL_RenderTexture(r, g.ui_dmg.tex, NULL, &(SDL_FRect){x+20, 30, g.ui_dmg.w, g.ui_dmg.h});
+            }
+        }
+        
+        if (g.cond_wheel && g.cond_token_idx >= 0) {
+            Token *t = &g.tokens[g.cond_token_idx];
+            float cx = win->w/2.0f, cy = win->h/2.0f;
+            float radius = 220.0f;
+            float inner_radius = 70.0f;
             
-            x++;
-            if (d > 0) {
-                y--;
-                d = d + 4 * (x - y) + 10;
-            } else {
-                d = d + 4 * x + 6;
+            float mx, my; SDL_GetMouseState(&mx, &my);
+            float dx = mx - cx, dy = my - cy;
+            float dist = sqrtf(dx*dx + dy*dy);
+            float angle = atan2f(dy, dx);
+            if (angle < 0) angle += 6.28318f;
+            
+            int hovered_index = -1;
+            if (dist >= inner_radius && dist <= radius) {
+                float segment_angle = 6.28318f / COND_COUNT;
+                hovered_index = (int)(angle / segment_angle);
+                if (hovered_index >= COND_COUNT) hovered_index = COND_COUNT - 1;
+            }
+            
+            SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+            
+            static const float cond_cols[COND_COUNT][3] = {
+                {220,20,20}, {255,215,0}, {147,51,234}, {255,140,0},
+                {139,69,19}, {30,144,255}, {255,20,147}, {50,205,50}
+            };
+            
+            // Draw wheel segments
+            for (int i = 0; i < COND_COUNT; i++) {
+                bool is_active = t->cond[i];
+                float start_angle = (6.28318f * i) / COND_COUNT;
+                float end_angle = (6.28318f * (i + 1)) / COND_COUNT;
+                
+                float rf, gf, bf, alpha;
+                if (is_active) {
+                    float gray = (cond_cols[i][0] * 0.3f + cond_cols[i][1] * 0.59f + cond_cols[i][2] * 0.11f) / 255.0f;
+                    rf = gf = bf = gray * 0.5f;
+                    alpha = (i == hovered_index) ? 0.9f : 0.7f;
+                } else {
+                    rf = cond_cols[i][0] / 255.0f;
+                    gf = cond_cols[i][1] / 255.0f;
+                    bf = cond_cols[i][2] / 255.0f;
+                    alpha = (i == hovered_index) ? 1.0f : 0.85f;
+                }
+                
+                int steps = 30;
+                for (int step = 0; step < steps; step++) {
+                    float a1 = start_angle + (end_angle - start_angle) * step / steps;
+                    float a2 = start_angle + (end_angle - start_angle) * (step + 1) / steps;
+                    
+                    SDL_Vertex vertices[4] = {
+                        {{cx + inner_radius * cosf(a1), cy + inner_radius * sinf(a1)}, {rf, gf, bf, alpha}, {0, 0}},
+                        {{cx + radius * cosf(a1), cy + radius * sinf(a1)}, {rf, gf, bf, alpha}, {0, 0}},
+                        {{cx + radius * cosf(a2), cy + radius * sinf(a2)}, {rf, gf, bf, alpha}, {0, 0}},
+                        {{cx + inner_radius * cosf(a2), cy + inner_radius * sinf(a2)}, {rf, gf, bf, alpha}, {0, 0}}
+                    };
+                    
+                    int indices[6] = {0, 1, 2, 0, 2, 3};
+                    SDL_RenderGeometry(r, NULL, vertices, 4, indices, 6);
+                }
+                
+                // Border lines
+                SDL_SetRenderDrawColor(r, 255, 255, 255, i == hovered_index ? 255 : 180);
+                SDL_RenderLine(r, 
+                    cx + inner_radius * cosf(start_angle), cy + inner_radius * sinf(start_angle),
+                    cx + radius * cosf(start_angle), cy + radius * sinf(start_angle));
+            }
+            
+            // Render condition names in each segment
+            for (int i = 0; i < COND_COUNT; i++) {
+                float mid_angle = (6.28318f * i + 6.28318f * (i + 1)) / (2.0f * COND_COUNT);
+                float mid_radius = (inner_radius + radius) / 2.0f;
+                float text_x = cx + cosf(mid_angle) * mid_radius;
+                float text_y = cy + sinf(mid_angle) * mid_radius;
+                
+                // Render text from pre-baked textures
+                if (g.cond_wheel_tex[i]) {
+                    float tw, th;
+                    SDL_GetTextureSize(g.cond_wheel_tex[i], &tw, &th);
+                    SDL_RenderTexture(r, g.cond_wheel_tex[i], NULL, &(SDL_FRect){text_x - tw/2.0f, text_y - th/2.0f, tw, th});
+                }
+            }
+            
+            // Center circle
+            SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
+            int ir = (int)inner_radius;
+            for (int y = -ir; y <= ir; y++) {
+                int half_width = (int)sqrtf(inner_radius * inner_radius - y * y);
+                if (half_width > 0) {
+                    SDL_FRect line = {cx - half_width, cy + y, half_width * 2, 1};
+                    SDL_RenderFillRect(r, &line);
+                }
+            }
+            
+            // Outer circle border
+            SDL_SetRenderDrawColor(r, 255, 255, 255, 200);
+            for (int i = 0; i < 360; i += 2) {
+                float a = i * 0.0174533f;
+                SDL_RenderPoint(r, cx + radius * cosf(a), cy + radius * sinf(a));
             }
         }
     }
+    
+    SDL_RenderPresent(r);
 }
 
-// ============================================================================
-// DAMAGE INPUT UI (with texture caching)
-// ============================================================================
-
-void render_damage_input_ui(SDL_Renderer *renderer, const InputState *input, int window_width, int window_height) {
-    (void)window_height;  // Unused parameter
-    if (!input->damage_input_mode || !g_font_loaded) return;
+// Helper for saving embedded PNG data
+static void write_embedded_asset(FILE *f, Asset *asset) {
+    ensure_asset_loaded(asset);
     
-    const char *prefix = input->shift_pressed ? "Heal: " : "Damage: ";
-    char display_text[64];
-    if (input->damage_input_len > 0) {
-        snprintf(display_text, sizeof(display_text), "%s%s_", prefix, input->damage_input_buffer);
+    // Write path
+    int path_len = strlen(asset->path);
+    fwrite(&path_len, 4, 1, f);
+    fwrite(asset->path, 1, path_len, f);
+    
+    // Read image from file
+    int w, h;
+    unsigned char *data = stbi_load(asset->path, &w, &h, NULL, 4);
+    if (data) {
+        // Write PNG to memory for compression
+        int png_len;
+        unsigned char *png_data = stbi_write_png_to_mem(data, w * 4, w, h, 4, &png_len);
+        if (png_data) {
+            fwrite(&png_len, 4, 1, f);
+            fwrite(png_data, 1, png_len, f);
+            free(png_data);
+        } else {
+            int zero = 0;
+            fwrite(&zero, 4, 1, f);
+        }
+        stbi_image_free(data);
     } else {
-        snprintf(display_text, sizeof(display_text), "%s_", prefix);
-    }
-    
-    // Check if we need to regenerate cached texture
-    int cache_key = input->shift_pressed ? 1 : 0;
-    if (g_damage_input_cache.texture == NULL ||
-        strcmp(g_damage_input_cache.cached_text, display_text) != 0 ||
-        g_damage_input_cache.cached_value != cache_key) {
-        
-        // Destroy old texture
-        if (g_damage_input_cache.texture) {
-            SDL_DestroyTexture(g_damage_input_cache.texture);
-        }
-        
-        // Create new texture
-        g_damage_input_cache.texture = create_text_texture(renderer, display_text, 24.0f,
-                                                           &g_damage_input_cache.width,
-                                                           &g_damage_input_cache.height,
-                                                           255, 255, 255);
-        strncpy(g_damage_input_cache.cached_text, display_text, sizeof(g_damage_input_cache.cached_text) - 1);
-        g_damage_input_cache.cached_value = cache_key;
-    }
-    
-    if (!g_damage_input_cache.texture) return;
-    
-    // Calculate layout
-    float padding = 12.0f;
-    float bg_width = g_damage_input_cache.width + padding * 2;
-    float bg_height = g_damage_input_cache.height + padding * 2;
-    
-    SDL_FRect bg_rect = {
-        (window_width - bg_width) / 2,
-        20,
-        bg_width,
-        bg_height
-    };
-    
-    // Draw background
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer, 40, 40, 60, 240);
-    SDL_RenderFillRect(renderer, &bg_rect);
-    
-    // Draw border
-    SDL_SetRenderDrawColor(renderer, 
-                           input->shift_pressed ? 100 : 200, 
-                           input->shift_pressed ? 200 : 100, 
-                           100, 255);
-    SDL_FRect borders[2] = {
-        {bg_rect.x, bg_rect.y, bg_rect.w, bg_rect.h},
-        {bg_rect.x - 1, bg_rect.y - 1, bg_rect.w + 2, bg_rect.h + 2}
-    };
-    SDL_RenderRects(renderer, borders, 2);
-    
-    // Render cached text texture
-    SDL_FRect text_dst = {
-        bg_rect.x + padding,
-        bg_rect.y + padding,
-        g_damage_input_cache.width,
-        g_damage_input_cache.height
-    };
-    SDL_RenderTexture(renderer, g_damage_input_cache.texture, NULL, &text_dst);
-    
-    // Help text (static, cached once)
-    static SDL_Texture *help_tex = NULL;
-    static float help_w = 0, help_h = 0;
-    const char *help = "Enter=Confirm | Esc=Cancel | Shift=Toggle";
-    
-    if (!help_tex) {
-        help_tex = create_text_texture(renderer, help, 14.0f, &help_w, &help_h, 238, 238, 238);
-    }
-    
-    if (help_tex) {
-        SDL_FRect help_dst = {bg_rect.x, bg_rect.y + bg_rect.h + 8, help_w, help_h};
-        SDL_RenderTexture(renderer, help_tex, NULL, &help_dst);
+        int zero = 0;
+        fwrite(&zero, 4, 1, f);
     }
 }
 
-// ============================================================================
-// RENDERER
-// ============================================================================
-
-void renderer_render_dm(WindowState *window, const Map *map, const TokenManager *tokens,
-                        const FogOfWar *fog, const InputState *input, Camera *camera) {
-    SDL_Renderer *renderer = window->renderer;
-    float zoom = camera->zoom;
-    
-    // Get actual window dimensions
-    int win_width, win_height;
-    SDL_GetWindowSize(window->window, &win_width, &win_height);
-    
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-    SDL_RenderClear(renderer);
-    
-    if (map->dm_texture) {
-        SDL_FRect dst = {-camera->x * zoom, -camera->y * zoom, map->width * zoom, map->height * zoom};
-        SDL_RenderTexture(renderer, map->dm_texture, NULL, &dst);
+// Helper for loading embedded PNG data
+static int read_embedded_asset(FILE *f, int *out_idx, Asset *lib, int *lib_count, int max_count) {
+    // Read path
+    int path_len;
+    if (fread(&path_len, 4, 1, f) != 1) return -1;
+    char path[256] = {0};
+    if (path_len > 0 && path_len < 256) {
+        fread(path, 1, path_len, f);
     }
     
-    // Render grid only if visible
-    if (input->show_grid) {
-        grid_render(renderer, map, (int)camera->x, (int)camera->y,
-                    win_width, win_height, zoom);
+    // Read PNG data
+    int png_len;
+    if (fread(&png_len, 4, 1, f) != 1) return -1;
+    if (png_len <= 0 || png_len > 50*1024*1024) return -1; // Sanity check: max 50MB
+    
+    unsigned char *png_data = malloc(png_len);
+    if (!png_data) return -1;
+    if (fread(png_data, 1, png_len, f) != (size_t)png_len) {
+        free(png_data);
+        return -1;
     }
     
-    fog_render(renderer, fog, camera->x, camera->y,
-               win_width, win_height, map->grid_size,
-               map->grid_offset_x, map->grid_offset_y, zoom, true);
+    // Check if asset already exists in library
+    for (int i = 0; i < *lib_count; i++) {
+        if (strcmp(lib[i].path, path) == 0) {
+            free(png_data);
+            *out_idx = i;
+            return 0;
+        }
+    }
     
-    // Render drawings
-    drawing_render_all(renderer, &g_drawings, (int)camera->x, (int)camera->y, zoom);
+    // Add new asset to library
+    if (*lib_count >= max_count) {
+        free(png_data);
+        return -1;
+    }
     
-    token_manager_render_all(renderer, tokens, (int)camera->x, (int)camera->y,
-                             map->grid_size, map->grid_offset_x, map->grid_offset_y,
-                             zoom, true, fog);
+    int idx = *lib_count;
+    if (load_asset_from_memory(png_data, png_len, &lib[idx], path) == 0) {
+        (*lib_count)++;
+        *out_idx = idx;
+        free(png_data);
+        return 0;
+    }
     
-    // Render calibration overlay
-    grid_calibration_render(renderer, &g_grid_calibration, camera->x, camera->y, zoom);
-    
-    // Render drawing preview
-    render_drawing_preview(renderer, input, camera->x, camera->y, zoom);
-    
-    // Render UI overlays
-    render_draw_mode_ui(renderer, input, win_width, win_height);
-    render_squad_mode_ui(renderer, input, win_width, win_height);
-    render_damage_input_ui(renderer, input, win_width, win_height);
-    render_condition_wheel(renderer, input, tokens, win_width, win_height);
-    
-    SDL_RenderPresent(renderer);
+    free(png_data);
+    return -1;
 }
 
-void renderer_render_player(WindowState *window, const Map *map, const TokenManager *tokens,
-                            const FogOfWar *fog, Camera *camera) {
-    SDL_Renderer *renderer = window->renderer;
-    float zoom = camera->zoom;
-    
-    // Get actual window dimensions
-    int win_width, win_height;
-    SDL_GetWindowSize(window->window, &win_width, &win_height);
-    
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-    SDL_RenderClear(renderer);
-    
-    if (map->player_texture) {
-        SDL_FRect dst = {-camera->x * zoom, -camera->y * zoom, map->width * zoom, map->height * zoom};
-        SDL_RenderTexture(renderer, map->player_texture, NULL, &dst);
-    }
-    
-    // Render drawings (visible on player view)
-    drawing_render_all(renderer, &g_drawings, (int)camera->x, (int)camera->y, zoom);
-    
-    token_manager_render_all(renderer, tokens, (int)camera->x, (int)camera->y,
-                             map->grid_size, map->grid_offset_x, map->grid_offset_y,
-                             zoom, false, fog);
-    
-    fog_render(renderer, fog, camera->x, camera->y,
-               win_width, win_height, map->grid_size,
-               map->grid_offset_x, map->grid_offset_y, zoom, false);
-    
-    SDL_RenderPresent(renderer);
-}
-
-// ============================================================================
-// INPUT HANDLING
-// ============================================================================
-
-void input_init(InputState *input) {
-    input->current_tool = TOOL_SELECT;
-    input->mouse_x = 0;
-    input->mouse_y = 0;
-    input->mouse_left_down = false;
-    input->mouse_right_down = false;
-    input->last_mouse_x = 0;
-    input->last_mouse_y = 0;
-    input->dragging_token = false;
-    input->dragged_token_index = -1;
-    input->painting_fog = false;
-    input->fog_paint_mode = false;
-    input->shift_pressed = false;
-    input->ctrl_pressed = false;
-    input->show_grid = true;  // Grid visible by default
-    input->damage_input_mode = false;
-    input->damage_input_buffer[0] = '\0';
-    input->damage_input_len = 0;
-    input->current_squad = 0;  // Default to first squad color (Red)
-    input->drawing_shape = false;
-    input->current_shape = SHAPE_RECTANGLE;
-    input->draw_start_x = 0;
-    input->draw_start_y = 0;
-    input->condition_wheel_open = false;
-    input->condition_wheel_token_index = -1;
-}
-
-void input_handle_dm_mouse(Camera *camera, InputState *input, TokenManager *tokens,
-                           FogOfWar *fog, Map *map, SDL_Event *event) {
-    float zoom = camera->zoom;
-    float cam_x = camera->x;
-    float cam_y = camera->y;
-    
-    // Handle calibration mode separately
-    if (g_grid_calibration.active) {
-        if (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN && event->button.button == SDL_BUTTON_LEFT) {
-            g_grid_calibration.dragging = true;
-            g_grid_calibration.start_x = (int)(event->button.x / zoom + cam_x);
-            g_grid_calibration.start_y = (int)(event->button.y / zoom + cam_y);
-        }
+static void handle_input() {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_EVENT_QUIT) exit(0);
         
-        if (event->type == SDL_EVENT_MOUSE_MOTION && g_grid_calibration.dragging) {
-            g_grid_calibration.end_x = (int)(event->motion.x / zoom + cam_x);
-            g_grid_calibration.end_y = (int)(event->motion.y / zoom + cam_y);
-        }
-        
-        if (event->type == SDL_EVENT_MOUSE_BUTTON_UP && event->button.button == SDL_BUTTON_LEFT) {
-            g_grid_calibration.dragging = false;
-        }
-        return;  // Don't process other mouse events in calibration mode
-    }
-    
-    // Handle condition wheel clicks
-    if (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN && event->button.button == SDL_BUTTON_LEFT && input->condition_wheel_open) {
-        int win_width, win_height;
-        SDL_GetWindowSize(g_wm.dm_window.window, &win_width, &win_height);
-        
-        float center_x = win_width / 2.0f;
-        float center_y = win_height / 2.0f;
-        float radius = 150.0f * CONDITION_WHEEL_SCALE;
-        float inner_radius = 50.0f * CONDITION_WHEEL_SCALE;
-        
-        float dx = event->button.x - center_x;
-        float dy = event->button.y - center_y;
-        float dist = sqrtf(dx * dx + dy * dy);
-        
-        if (dist >= inner_radius && dist <= radius) {
-            if (input->condition_wheel_token_index >= 0 && input->condition_wheel_token_index < tokens->count) {
-                Token *token = &tokens->tokens[input->condition_wheel_token_index];
+        if (e.type == SDL_EVENT_KEY_DOWN) {
+            g.shift = (e.key.mod & SDL_KMOD_SHIFT) != 0;
+            g.ctrl = (e.key.mod & SDL_KMOD_CTRL) != 0;
+            SDL_Keycode k = e.key.key;
+            
+            if (!g.dmg_input && !g.cond_wheel) {
+                // Only allow tool switching if no token is selected
+                bool any_selected = false;
+                for (int i = 0; i < g.token_count; i++) {
+                    if (g.tokens[i].selected) { any_selected = true; break; }
+                }
                 
-                float angle = atan2f(dy, dx);
-                if (angle < 0) angle += 2.0f * M_PI;
-                
-                float segment_angle = (2.0f * M_PI) / CONDITION_COUNT;
-                int clicked_condition = (int)(angle / segment_angle);
-                if (clicked_condition >= CONDITION_COUNT) clicked_condition = CONDITION_COUNT - 1;
-                
-                // Toggle condition on/off
-                token->conditions[clicked_condition] = !token->conditions[clicked_condition];
-    //                 SDL_Log("Token %s: %s condition %s", token->name,
-    //                     token->conditions[clicked_condition] ? "Added" : "Removed",
-    //                     CONDITION_INFO[clicked_condition].name);
+                if (!any_selected) {
+                    if (k == SDLK_1) g.tool = TOOL_SELECT;
+                    if (k == SDLK_2) g.tool = TOOL_FOG;
+                    if (k == SDLK_3) g.tool = TOOL_SQUAD;
+                    if (k == SDLK_4) g.tool = TOOL_DRAW;
+                }
             }
-        }
-        return;  // Don't process other mouse actions while wheel is open
-    }
-    
-    // Normal mouse handling
-    if (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN && event->button.button == SDL_BUTTON_LEFT) {
-        int grid_x, grid_y;
-        grid_screen_to_grid_direct(event->button.x, event->button.y,
-                                   cam_x, cam_y, zoom,
-                                   map->grid_size, map->grid_offset_x, map->grid_offset_y,
-                                   &grid_x, &grid_y);
-        
-        if (input->current_tool == TOOL_SELECT) {
-            Token *token = token_get_at_grid(tokens, grid_x, grid_y);
-            if (token) {
-                int token_idx = -1;
-                for (int i = 0; i < tokens->count; i++) {
-                    if (&tokens->tokens[i] == token) {
-                        token_idx = i;
+            
+            if ((g.tool == TOOL_SQUAD || g.tool == TOOL_DRAW) && (k == SDLK_Q || k == SDLK_E)) {
+                g.current_squad = (g.current_squad + (k == SDLK_E ? 1 : -1) + 8) % 8;
+            }
+            
+            if (g.current_shape == SHAPE_RECT && g.tool == TOOL_DRAW && k == SDLK_W) {
+                g.current_shape = SHAPE_CIRCLE;
+            } else if (g.current_shape == SHAPE_CIRCLE && g.tool == TOOL_DRAW && k == SDLK_W) {
+                g.current_shape = SHAPE_RECT;
+            }
+            
+            if (k == SDLK_C && !g.cal_active) {
+                g.cal_active = true; g.cal_drag = false;
+                g.cal_cells_w = g.cal_cells_h = 2;
+            }
+            
+            if (g.cal_active) {
+                if (k == SDLK_RETURN) {
+                    int w = abs(g.cal_x2 - g.cal_x1), h = abs(g.cal_y2 - g.cal_y1);
+                    if (w > 10 && h > 10) {
+                        g.grid_size = (w/g.cal_cells_w + h/g.cal_cells_h)/2;
+                        g.grid_off_x = (g.cal_x1 < g.cal_x2 ? g.cal_x1 : g.cal_x2) % g.grid_size;
+                        g.grid_off_y = (g.cal_y1 < g.cal_y2 ? g.cal_y1 : g.cal_y2) % g.grid_size;
+                        fog_init((g.map_w + g.grid_size)/g.grid_size, (g.map_h + g.grid_size)/g.grid_size);
+                    }
+                    g.cal_active = false;
+                }
+                if (k == SDLK_ESCAPE) g.cal_active = false;
+                if (g.cal_drag) {
+                    if (k == SDLK_UP) g.cal_cells_h++;
+                    if (k == SDLK_DOWN && g.cal_cells_h > 1) g.cal_cells_h--;
+                    if (k == SDLK_RIGHT) g.cal_cells_w++;
+                    if (k == SDLK_LEFT && g.cal_cells_w > 1) g.cal_cells_w--;
+                }
+                continue;
+            }
+            
+            if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
+                for (int i = 0; i < g.token_count; i++) {
+                    if (g.tokens[i].selected) {
+                        if (g.tokens[i].damage_tex[0]) SDL_DestroyTexture(g.tokens[i].damage_tex[0]);
+                        if (g.tokens[i].damage_tex[1]) SDL_DestroyTexture(g.tokens[i].damage_tex[1]);
+                        memmove(&g.tokens[i], &g.tokens[i+1], (g.token_count-i-1)*sizeof(Token));
+                        g.token_count--;
                         break;
                     }
                 }
-                
-                if (input->shift_pressed || input->ctrl_pressed) {
-                    int new_idx = token_copy(tokens, token_idx, grid_x, grid_y,
-                                             g_wm.dm_window.renderer, g_wm.player_window.renderer);
-                    if (new_idx >= 0) {
-                        token_deselect_all(tokens);
-                        tokens->tokens[new_idx].selected = true;
-                        input->dragging_token = true;
-                        input->dragged_token_index = new_idx;
+            }
+            
+            if (k == SDLK_H) {
+                for (int i = 0; i < g.token_count; i++) 
+                    if (g.tokens[i].selected) g.tokens[i].hidden = !g.tokens[i].hidden;
+            }
+            
+            if (k == SDLK_D) {
+                if (g.shift) {
+                    for (int i = 0; i < g.token_count; i++) g.tokens[i].opacity = 255;
+                } else {
+                    for (int i = 0; i < g.token_count; i++) 
+                        if (g.tokens[i].selected) g.tokens[i].opacity = (g.tokens[i].opacity == 255) ? 128 : 255;
+                }
+            }
+            
+            if (k == SDLK_RETURN && !g.dmg_input) {
+                for (int i = 0; i < g.token_count; i++) {
+                    if (g.tokens[i].selected) { 
+                        g.dmg_input = true; 
+                        g.dmg_buf[0] = 0; 
+                        g.dmg_len = 0; 
+                        break; 
+                    }
+                }
+            } else if (g.dmg_input) {
+                if (k == SDLK_RETURN) {
+                    int val = atoi(g.dmg_buf);
+                    if (g.shift) val = -val;
+                    for (int i = 0; i < g.token_count; i++) {
+                        if (g.tokens[i].selected) {
+                            g.tokens[i].damage += val;
+                            if (g.tokens[i].damage < 0) g.tokens[i].damage = 0;
+                        }
+                    }
+                    g.dmg_input = false;
+                } else if (k == SDLK_ESCAPE) {
+                    g.dmg_input = false;
+                } else if (k == SDLK_BACKSPACE && g.dmg_len > 0) {
+                    g.dmg_buf[--g.dmg_len] = 0;
+                } else if (k >= SDLK_0 && k <= SDLK_9 && g.dmg_len < 15) {
+                    g.dmg_buf[g.dmg_len++] = '0' + (k - SDLK_0);
+                    g.dmg_buf[g.dmg_len] = 0;
+                } else if (k >= SDLK_KP_0 && k <= SDLK_KP_9 && g.dmg_len < 15) {
+                    g.dmg_buf[g.dmg_len++] = '0' + (k - SDLK_KP_0);
+                    g.dmg_buf[g.dmg_len] = 0;
+                }
+                continue;
+            }
+            
+            if (k == SDLK_A && !g.cond_wheel) {
+                for (int i = 0; i < g.token_count; i++) {
+                    if (g.tokens[i].selected) { g.cond_wheel = true; g.cond_token_idx = i; break; }
+                }
+            } else if (g.cond_wheel && k == SDLK_ESCAPE) {
+                g.cond_wheel = false;
+            }
+            
+            if (k >= SDLK_F1 && k <= SDLK_F12) {
+                int slot = k - SDLK_F1;
+                char path[64]; snprintf(path, 64, "saves/slot_%d.vtt", slot);
+                uint32_t magic = SAVE_MAGIC;
+                if (g.shift) {
+                    // SAVE
+                    FILE *f = fopen(path, "wb");
+                    if (f) {
+                        // Write header
+                        fwrite(&magic, 4, 1, f);
+                        fwrite(&g.fog_w, 4, 1, f);
+                        fwrite(&g.fog_h, 4, 1, f);
+                        fwrite(&g.grid_size, 4, 1, f);
+                        fwrite(&g.grid_off_x, 4, 1, f);
+                        fwrite(&g.grid_off_y, 4, 1, f);
+                        fwrite(&g.cam[0].target_x, 4, 1, f);
+                        fwrite(&g.cam[0].target_y, 4, 1, f);
+                        fwrite(&g.cam[0].target_zoom, 4, 1, f);
+                        
+                        // Write embedded map asset
+                        if (g.map_current < g.map_count) {
+                            write_embedded_asset(f, &g.map_assets[g.map_current]);
+                        } else {
+                            int zero = 0;
+                            fwrite(&zero, 4, 1, f);
+                            fwrite(&zero, 4, 1, f);
+                        }
+                        
+                        // Write token count and tokens with embedded assets
+                        fwrite(&g.token_count, 4, 1, f);
+                        for (int i = 0; i < g.token_count; i++) {
+                            Token *t = &g.tokens[i];
+                            fwrite(&t->grid_x, 4, 1, f);
+                            fwrite(&t->grid_y, 4, 1, f);
+                            fwrite(&t->size, 4, 1, f);
+                            fwrite(&t->damage, 4, 1, f);
+                            fwrite(&t->squad, 4, 1, f);
+                            fwrite(&t->opacity, 1, 1, f);
+                            fwrite(&t->hidden, 1, 1, f);
+                            fwrite(t->cond, 1, COND_COUNT, f);
+                            
+                            // Write embedded token image
+                            write_embedded_asset(f, &g.token_lib[t->image_idx]);
+                        }
+                        
+                        // Write fog data
+                        fwrite(g.fog, 1, g.fog_w*g.fog_h, f);
+                        fclose(f);
+                        printf("Saved to slot %d\n", slot + 1);
                     }
                 } else {
-                    token_deselect_all(tokens);
-                    token->selected = true;
-                    input->dragging_token = true;
-                    input->dragged_token_index = token_idx;
-                }
-            } else {
-                token_deselect_all(tokens);
-            }
-        } else if (input->current_tool == TOOL_FOG) {
-            // Start fog painting - determine mode based on initial cell state
-            input->painting_fog = true;
-            bool cell_visible = fog_is_visible(fog, grid_x, grid_y);
-            // If cell is visible, we'll paint fog (hide it). If fogged, we'll reveal it.
-            input->fog_paint_mode = cell_visible;
-            fog_set_cell(fog, grid_x, grid_y, !cell_visible);
-        } else if (input->current_tool == TOOL_SQUAD) {
-            // Squad mode - assign/remove squad from token
-            Token *token = token_get_at_grid(tokens, grid_x, grid_y);
-            if (token) {
-                // If token already has this squad, remove it; otherwise assign it
-                if (token->squad == input->current_squad) {
-                    token->squad = -1;
-    //                     SDL_Log("Removed %s from squad", token->name);
-                } else {
-                    token->squad = input->current_squad;
-    //                     SDL_Log("Assigned %s to squad %s", token->name, SQUAD_COLORS[input->current_squad].name);
-                }
-            }
-        } else if (input->current_tool == TOOL_DRAW) {
-            // Draw mode - start drawing shape
-            input->drawing_shape = true;
-            // Convert screen to world coordinates
-            input->draw_start_x = (int)(event->button.x / zoom + cam_x);
-            input->draw_start_y = (int)(event->button.y / zoom + cam_y);
-        }
-    }
-    
-    if (event->type == SDL_EVENT_MOUSE_BUTTON_UP && event->button.button == SDL_BUTTON_LEFT) {
-        input->dragging_token = false;
-        input->painting_fog = false;
-        
-        // Complete drawing shape
-        if (input->drawing_shape) {
-            int end_x = (int)(event->button.x / zoom + cam_x);
-            int end_y = (int)(event->button.y / zoom + cam_y);
-            
-            // Only add if shape has some size
-            if (abs(end_x - input->draw_start_x) > 5 || abs(end_y - input->draw_start_y) > 5) {
-                drawing_add(&g_drawings, input->current_shape,
-                            input->draw_start_x, input->draw_start_y,
-                            end_x, end_y,
-                            input->current_squad);
-            }
-            
-            input->drawing_shape = false;
-        }
-    }
-    
-    if (event->type == SDL_EVENT_MOUSE_MOTION && input->dragging_token) {
-        int grid_x, grid_y;
-        grid_screen_to_grid_direct(event->motion.x, event->motion.y,
-                                   cam_x, cam_y, zoom,
-                                   map->grid_size, map->grid_offset_x, map->grid_offset_y,
-                                   &grid_x, &grid_y);
-        if (input->dragged_token_index >= 0 && input->dragged_token_index < tokens->count) {
-            tokens->tokens[input->dragged_token_index].grid_x = grid_x;
-            tokens->tokens[input->dragged_token_index].grid_y = grid_y;
-        }
-    }
-    
-    if (event->type == SDL_EVENT_MOUSE_MOTION && input->painting_fog) {
-        int grid_x, grid_y;
-        grid_screen_to_grid_direct(event->motion.x, event->motion.y,
-                                   cam_x, cam_y, zoom,
-                                   map->grid_size, map->grid_offset_x, map->grid_offset_y,
-                                   &grid_x, &grid_y);
-        // Apply fog based on paint mode (add fog or remove fog)
-        fog_set_cell(fog, grid_x, grid_y, !input->fog_paint_mode);
-    }
-    
-    // Right-click in draw mode to delete shapes
-    if (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN && event->button.button == SDL_BUTTON_RIGHT) {
-        if (input->current_tool == TOOL_DRAW) {
-            int world_x = (int)(event->button.x / zoom + cam_x);
-            int world_y = (int)(event->button.y / zoom + cam_y);
-            
-            // Check drawings in reverse order (top to bottom)
-            for (int i = g_drawings.count - 1; i >= 0; i--) {
-                if (drawing_contains_point(&g_drawings.drawings[i], world_x, world_y)) {
-                    drawing_remove(&g_drawings, i);
-                    break;  // Only delete one at a time
+                    // LOAD
+                    FILE *f = fopen(path, "rb");
+                    if (f) {
+                        uint32_t rmagic;
+                        fread(&rmagic, 4, 1, f);
+                        if (rmagic == SAVE_MAGIC) {
+                            // Read header
+                            int fw, fh;
+                            fread(&fw, 4, 1, f);
+                            fread(&fh, 4, 1, f);
+                            if (fw != g.fog_w || fh != g.fog_h) fog_init(fw, fh);
+                            fread(&g.grid_size, 4, 1, f);
+                            fread(&g.grid_off_x, 4, 1, f);
+                            fread(&g.grid_off_y, 4, 1, f);
+                            fread(&g.cam[0].target_x, 4, 1, f);
+                            fread(&g.cam[0].target_y, 4, 1, f);
+                            fread(&g.cam[0].target_zoom, 4, 1, f);
+                            g.cam[0].x = g.cam[0].target_x;
+                            g.cam[0].y = g.cam[0].target_y;
+                            g.cam[0].zoom = g.cam[0].target_zoom;
+                            
+                            // Read embedded map asset
+                            int map_idx;
+                            if (read_embedded_asset(f, &map_idx, g.map_assets, &g.map_count, MAX_ASSETS) == 0) {
+                                g.map_current = map_idx;
+                                g.map_w = g.map_assets[map_idx].w;
+                                g.map_h = g.map_assets[map_idx].h;
+                            }
+                            
+                            // Read tokens with embedded assets
+                            fread(&g.token_count, 4, 1, f);
+                            for (int i = 0; i < g.token_count && i < MAX_TOKENS; i++) {
+                                Token *t = &g.tokens[i];
+                                fread(&t->grid_x, 4, 1, f);
+                                fread(&t->grid_y, 4, 1, f);
+                                fread(&t->size, 4, 1, f);
+                                fread(&t->damage, 4, 1, f);
+                                fread(&t->squad, 4, 1, f);
+                                fread(&t->opacity, 1, 1, f);
+                                fread(&t->hidden, 1, 1, f);
+                                fread(t->cond, 1, COND_COUNT, f);
+                                t->selected = false;
+                                t->damage_tex[0] = t->damage_tex[1] = NULL;
+                                t->cached_dmg[0] = t->cached_dmg[1] = -1;
+                                
+                                // Read embedded token image
+                                int tok_idx;
+                                if (read_embedded_asset(f, &tok_idx, g.token_lib, &g.token_lib_count, MAX_ASSETS) == 0) {
+                                    t->image_idx = tok_idx;
+                                } else {
+                                    t->image_idx = 0;
+                                }
+                            }
+                            
+                            // Read fog data
+                            if (g.fog) fread(g.fog, 1, g.fog_w*g.fog_h, f);
+                            printf("Loaded from slot %d\n", slot + 1);
+                        }
+                        fclose(f);
+                    }
                 }
             }
+            
+            if (k == SDLK_M) {
+                if (g.shift) g.map_current = (g.map_current - 1 + g.map_count) % g.map_count;
+                else g.map_current = (g.map_current + 1) % g.map_count;
+                if (g.map_current < g.map_count) {
+                    ensure_asset_loaded(&g.map_assets[g.map_current]);
+                    g.map_w = g.map_assets[g.map_current].w;
+                    g.map_h = g.map_assets[g.map_current].h;
+                }
+            }
+            
+            if (k == SDLK_P) g.sync_views = !g.sync_views;
+            if (k == SDLK_G) g.show_grid = !g.show_grid;
+            
+            if (k == SDLK_X && g.tool == TOOL_DRAW) {
+                g.drawing_count = 0;
+            }
+            
+            if ((k == SDLK_EQUALS || k == SDLK_KP_PLUS)) {
+                for (int i = 0; i < g.token_count; i++) 
+                    if (g.tokens[i].selected && g.tokens[i].size < 4) g.tokens[i].size++;
+            }
+            if ((k == SDLK_MINUS || k == SDLK_KP_MINUS)) {
+                for (int i = 0; i < g.token_count; i++) 
+                    if (g.tokens[i].selected && g.tokens[i].size > 1) g.tokens[i].size--;
+            }
+            
+            if (!g.dmg_input && k >= SDLK_1 && k <= SDLK_9) {
+                int dmg = (k - SDLK_0);
+                if (g.shift) dmg = -dmg;
+                for (int i = 0; i < g.token_count; i++) {
+                    if (g.tokens[i].selected) {
+                        g.tokens[i].damage += dmg;
+                        if (g.tokens[i].damage < 0) g.tokens[i].damage = 0;
+                    }
+                }
+            }
+            if (!g.dmg_input && k == SDLK_0) {
+                int dmg = 10;
+                if (g.shift) dmg = -10;
+                for (int i = 0; i < g.token_count; i++) {
+                    if (g.tokens[i].selected) {
+                        g.tokens[i].damage += dmg;
+                        if (g.tokens[i].damage < 0) g.tokens[i].damage = 0;
+                    }
+                }
+            }
+            
+            if (k == SDLK_ESCAPE && !g.cond_wheel && !g.dmg_input) {
+                for (int i = 0; i < g.token_count; i++) g.tokens[i].selected = false;
+            }
         }
-    }
-}
-
-void input_handle_camera(Camera *camera, InputState *input, SDL_Event *event,
-                         int map_width, int map_height, SDL_Window *window) {
-    int win_width, win_height;
-    SDL_GetWindowSize(window, &win_width, &win_height);
-    camera->view_width = win_width;
-    camera->view_height = win_height;
-    
-    switch (event->type) {
-        case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        if (event->button.button == SDL_BUTTON_RIGHT) {
-            input->mouse_right_down = true;
-            input->last_mouse_x = event->button.x;
-            input->last_mouse_y = event->button.y;
-        }
-        break;
         
-        case SDL_EVENT_MOUSE_BUTTON_UP:
-        if (event->button.button == SDL_BUTTON_RIGHT) {
-            input->mouse_right_down = false;
+        if (e.type == SDL_EVENT_KEY_UP) {
+            g.shift = (e.key.mod & SDL_KMOD_SHIFT) != 0;
+            g.ctrl = (e.key.mod & SDL_KMOD_CTRL) != 0;
         }
-        break;
         
-        case SDL_EVENT_MOUSE_MOTION:
-        if (input->mouse_right_down) {
-            int delta_x = event->motion.x - input->last_mouse_x;
-            int delta_y = event->motion.y - input->last_mouse_y;
-            camera_pan(camera, delta_x, delta_y);
-            input->last_mouse_x = event->motion.x;
-            input->last_mouse_y = event->motion.y;
-        }
-        break;
-        
-        case SDL_EVENT_MOUSE_WHEEL: {
-            float factor = (event->wheel.y > 0) ? (1.0f + ZOOM_SPEED) : (1.0f / (1.0f + ZOOM_SPEED));
-            camera_zoom_toward(camera, event->wheel.x, event->wheel.y, factor, map_width, map_height);
-            break;
-        }
-    }
-}
-
-void input_handle_keyboard(Camera *camera, InputState *input, Map *map, TokenManager *tokens, FogOfWar *fog,
-                           WindowManager *wm, SDL_Event *event) {
-    if (event->type == SDL_EVENT_KEY_DOWN) {
-        input->shift_pressed = (event->key.mod & SDL_KMOD_SHIFT) != 0;
-        input->ctrl_pressed = (event->key.mod & SDL_KMOD_CTRL) != 0;
-        
-        // Handle damage input mode
-        if (input->damage_input_mode) {
-            if (event->key.key == SDLK_RETURN) {
-                // Confirm and apply damage
-                if (input->damage_input_len > 0) {
-                    int damage_change = atoi(input->damage_input_buffer);
-                    if (input->shift_pressed) {
-                        damage_change = -damage_change;  // Heal
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            float mx = e.button.x, my = e.button.y;
+            int gx, gy; 
+            screen_to_grid(mx, my, &g.cam[0], &gx, &gy);
+            
+            if (g.cal_active && e.button.button == 1) {
+                g.cal_x1 = g.cal_x2 = (int)(mx/g.cam[0].zoom + g.cam[0].x);
+                g.cal_y1 = g.cal_y2 = (int)(my/g.cam[0].zoom + g.cam[0].y);
+                g.cal_drag = true;
+            } else if (e.button.button == 1) {
+                if (g.cond_wheel) {
+                    float cx = g.dm.w/2.0f, cy = g.dm.h/2.0f;
+                    float radius = 220.0f;
+                    float inner_radius = 70.0f;
+                    
+                    float dx = mx - cx, dy = my - cy;
+                    float dist = sqrtf(dx*dx + dy*dy);
+                    
+                    if (dist >= inner_radius && dist <= radius && g.cond_token_idx >= 0) {
+                        float angle = atan2f(dy, dx);
+                        if (angle < 0) angle += 6.28318f;
+                        float segment_angle = 6.28318f / COND_COUNT;
+                        int clicked_index = (int)(angle / segment_angle);
+                        if (clicked_index >= 0 && clicked_index < COND_COUNT) {
+                            g.tokens[g.cond_token_idx].cond[clicked_index] = !g.tokens[g.cond_token_idx].cond[clicked_index];
+                        }
+                    }
+                } else if (g.tool == TOOL_SELECT) {
+                    Token *hit = NULL;
+                    int hit_idx = -1;
+                    for (int i = g.token_count-1; i >= 0; i--) {
+                        if (g.tokens[i].grid_x == gx && g.tokens[i].grid_y == gy) {
+                            hit = &g.tokens[i];
+                            hit_idx = i;
+                            break;
+                        }
                     }
                     
-                    for (int i = 0; i < tokens->count; i++) {
-                        if (tokens->tokens[i].selected) {
-                            tokens->tokens[i].damage += damage_change;
-                            if (tokens->tokens[i].damage < 0) {
-                                tokens->tokens[i].damage = 0;
-                            }
-    //                             SDL_Log("Token %s damage: %d (%s%d)", 
-    //                                 tokens->tokens[i].name, 
-    //                                 tokens->tokens[i].damage,
-    //                                 input->shift_pressed ? "-" : "+",
-    //                                 abs(damage_change));
+                    if (hit && (g.shift || g.ctrl) && g.token_count < MAX_TOKENS) {
+                        for (int j = 0; j < g.token_count; j++) g.tokens[j].selected = false;
+                        g.tokens[g.token_count] = *hit;
+                        g.tokens[g.token_count].selected = true;
+                        g.tokens[g.token_count].damage_tex[0] = g.tokens[g.token_count].damage_tex[1] = NULL;
+                        g.tokens[g.token_count].cached_dmg[0] = g.tokens[g.token_count].cached_dmg[1] = -1;
+                        g.tokens[g.token_count].grid_x = gx;
+                        g.tokens[g.token_count].grid_y = gy;
+                        g.drag_token = true;
+                        g.drag_idx = g.token_count++;
+                    } else if (hit) {
+                        if (!g.shift && !g.ctrl) 
+                            for (int j = 0; j < g.token_count; j++) g.tokens[j].selected = false;
+                        g.tokens[hit_idx].selected = true;
+                        g.drag_token = true;
+                        g.drag_idx = hit_idx;
+                    } else {
+                        for (int j = 0; j < g.token_count; j++) g.tokens[j].selected = false;
+                    }
+                } else if (g.tool == TOOL_FOG) {
+                    g.paint_fog = true;
+                    g.fog_mode = fog_get(gx, gy);
+                    fog_set(gx, gy, !g.fog_mode);
+                } else if (g.tool == TOOL_SQUAD) {
+                    for (int i = 0; i < g.token_count; i++) {
+                        if (g.tokens[i].grid_x == gx && g.tokens[i].grid_y == gy) {
+                            g.tokens[i].squad = (g.tokens[i].squad == g.current_squad) ? -1 : g.current_squad;
+                        }
+                    }
+                } else if (g.tool == TOOL_DRAW) {
+                    g.draw_shape = true;
+                    g.paint_start_x = (int)(mx/g.cam[0].zoom + g.cam[0].x);
+                    g.paint_start_y = (int)(my/g.cam[0].zoom + g.cam[0].y);
+                }
+            } else if (e.button.button == 3) {
+                g.last_mx = mx; g.last_my = my;
+            } else if (e.button.button == 2 && g.tool == TOOL_DRAW) {
+                int wx = (int)(mx/g.cam[0].zoom + g.cam[0].x);
+                int wy = (int)(my/g.cam[0].zoom + g.cam[0].y);
+                for (int i = g.drawing_count-1; i >= 0; i--) {
+                    Drawing *d = &g.drawings[i];
+                    if (d->type == SHAPE_RECT) {
+                        if (wx >= fmin(d->x1,d->x2) && wx <= fmax(d->x1,d->x2) &&
+                            wy >= fmin(d->y1,d->y2) && wy <= fmax(d->y1,d->y2)) {
+                            memmove(&g.drawings[i], &g.drawings[i+1], (g.drawing_count-i-1)*sizeof(Drawing));
+                            g.drawing_count--;
+                            break;
+                        }
+                    } else {
+                        int cx = (d->x1+d->x2)/2, cy = (d->y1+d->y2)/2;
+                        int r2 = ((d->x2-d->x1)*(d->x2-d->x1) + (d->y2-d->y1)*(d->y2-d->y1))/4;
+                        if ((wx-cx)*(wx-cx) + (wy-cy)*(wy-cy) <= r2) {
+                            memmove(&g.drawings[i], &g.drawings[i+1], (g.drawing_count-i-1)*sizeof(Drawing));
+                            g.drawing_count--;
                             break;
                         }
                     }
                 }
-                
-                // Exit damage input mode
-                input->damage_input_mode = false;
-                input->damage_input_buffer[0] = '\0';
-                input->damage_input_len = 0;
-                return;
-            }
-            else if (event->key.key == SDLK_ESCAPE) {
-                // Cancel damage input
-                input->damage_input_mode = false;
-                input->damage_input_buffer[0] = '\0';
-                input->damage_input_len = 0;
-    //                 SDL_Log("Damage input cancelled");
-                return;
-            }
-            else if (event->key.key == SDLK_BACKSPACE && input->damage_input_len > 0) {
-                // Remove last character
-                input->damage_input_len--;
-                input->damage_input_buffer[input->damage_input_len] = '\0';
-                return;
-            }
-            else if (event->key.key >= SDLK_0 && event->key.key <= SDLK_9) {
-                // Add digit to buffer
-                if (input->damage_input_len < 15) {
-                    input->damage_input_buffer[input->damage_input_len] = '0' + (event->key.key - SDLK_0);
-                    input->damage_input_len++;
-                    input->damage_input_buffer[input->damage_input_len] = '\0';
-                }
-                return;
-            }
-            else if (event->key.key >= SDLK_KP_0 && event->key.key <= SDLK_KP_9) {
-                // Add numpad digit to buffer
-                if (input->damage_input_len < 15) {
-                    input->damage_input_buffer[input->damage_input_len] = '0' + (event->key.key - SDLK_KP_0);
-                    input->damage_input_len++;
-                    input->damage_input_buffer[input->damage_input_len] = '\0';
-                }
-                return;
-            }
-            // Ignore other keys in damage input mode (except shift for toggling)
-            return;
-        }
-        
-        // Enter key - start damage input mode if token is selected
-        if (event->key.key == SDLK_RETURN && !input->damage_input_mode) {
-            // Check if any token is selected
-            bool has_selection = false;
-            for (int i = 0; i < tokens->count; i++) {
-                if (tokens->tokens[i].selected) {
-                    has_selection = true;
-                    break;
-                }
-            }
-            
-            if (has_selection) {
-                input->damage_input_mode = true;
-                input->damage_input_buffer[0] = '\0';
-                input->damage_input_len = 0;
-    //                 SDL_Log("Damage input mode started (Shift = heal)");
-                return;
             }
         }
         
-        // Opacity control with D key
-        if (event->key.key == SDLK_D) {
-            if (input->shift_pressed) {
-                // Shift+D: Reset all token opacities
-                for (int i = 0; i < tokens->count; i++) {
-                    tokens->tokens[i].opacity = 255;
-                }
-    //                 SDL_Log("All token opacities reset to fully opaque");
-            } else {
-                // D: Toggle selected token opacity (downed/normal)
-                for (int i = 0; i < tokens->count; i++) {
-                    if (tokens->tokens[i].selected) {
-                        if (tokens->tokens[i].opacity == 255) {
-                            tokens->tokens[i].opacity = 128;
-    //                             SDL_Log("Token %s marked as downed (50%% opacity)", tokens->tokens[i].name);
-                        } else {
-                            tokens->tokens[i].opacity = 255;
-    //                             SDL_Log("Token %s restored to normal (100%% opacity)", tokens->tokens[i].name);
-                        }
-                        break;
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+            if (g.cal_active && e.button.button == 1) {
+                g.cal_drag = false;
+            } else if (e.button.button == 1) {
+                g.drag_token = false;
+                if (g.draw_shape && g.drawing_count < MAX_DRAWINGS) {
+                    float mx = e.button.x, my = e.button.y;
+                    int ex = (int)(mx/g.cam[0].zoom + g.cam[0].x);
+                    int ey = (int)(my/g.cam[0].zoom + g.cam[0].y);
+                    if (abs(ex - g.paint_start_x) > 5 || abs(ey - g.paint_start_y) > 5) {
+                        Drawing *d = &g.drawings[g.drawing_count++];
+                        d->type = g.current_shape;
+                        d->x1 = g.paint_start_x; d->y1 = g.paint_start_y;
+                        d->x2 = ex; d->y2 = ey;
+                        d->color = g.current_squad;
                     }
                 }
+                g.draw_shape = false;
+                g.paint_fog = false;
             }
         }
         
-        // Condition wheel with A key
-        if (event->key.key == SDLK_A && !input->condition_wheel_open) {
-            // Find selected token
-            for (int i = 0; i < tokens->count; i++) {
-                if (tokens->tokens[i].selected) {
-                    input->condition_wheel_open = true;
-                    input->condition_wheel_token_index = i;
-    //                     SDL_Log("Condition wheel opened for token: %s", tokens->tokens[i].name);
-                    break;
+        if (e.type == SDL_EVENT_MOUSE_MOTION) {
+            float mx = e.motion.x, my = e.motion.y;
+            if (g.cal_drag) {
+                g.cal_x2 = (int)(mx/g.cam[0].zoom + g.cam[0].x);
+                g.cal_y2 = (int)(my/g.cam[0].zoom + g.cam[0].y);
+            } else if (g.drag_token && g.drag_idx >= 0) {
+                int gx, gy; 
+                screen_to_grid(mx, my, &g.cam[0], &gx, &gy);
+                g.tokens[g.drag_idx].grid_x = gx;
+                g.tokens[g.drag_idx].grid_y = gy;
+            } else if (g.paint_fog) {
+                int gx, gy; 
+                screen_to_grid(mx, my, &g.cam[0], &gx, &gy);
+                fog_set(gx, gy, !g.fog_mode);
+            } else if (e.motion.state & SDL_BUTTON_MASK(3)) {
+                g.cam[0].target_x -= (mx - g.last_mx)/g.cam[0].zoom;
+                g.cam[0].target_y -= (my - g.last_my)/g.cam[0].zoom;
+                g.last_mx = mx; g.last_my = my;
+            }
+        }
+        
+        if (e.type == SDL_EVENT_MOUSE_WHEEL) {
+            float mx, my;
+            SDL_GetMouseState(&mx, &my);
+            cam_zoom(&g.cam[0], mx, my, e.wheel.y > 0 ? 1.1f : 0.9f);
+        }
+        
+        if (e.type == SDL_EVENT_DROP_FILE) {
+            if (is_image(e.drop.data) && g.token_count < MAX_TOKENS) {
+                float mx, my;
+                SDL_GetMouseState(&mx, &my);
+                int gx, gy; 
+                screen_to_grid(mx, my, &g.cam[0], &gx, &gy);
+                int idx = find_or_load_token_image(e.drop.data);
+                if (idx >= 0) {
+                    Token *t = &g.tokens[g.token_count++];
+                    memset(t, 0, sizeof(Token));
+                    t->grid_x = gx; t->grid_y = gy; t->size = 1;
+                    t->image_idx = idx; t->opacity = 255;
+                    t->squad = -1;
                 }
             }
         }
-        
-        // Calibration mode handling
-        if (g_grid_calibration.active) {
-            if (event->key.key == SDLK_RETURN) {
-                grid_calibration_apply(&g_grid_calibration, map, fog);
-            } else if (event->key.key == SDLK_ESCAPE) {
-                g_grid_calibration.active = false;
-    //                 SDL_Log("Grid calibration cancelled");
-            }
-            // Arrow keys adjust cell count while dragging
-            else if (g_grid_calibration.dragging) {
-                if (event->key.key == SDLK_UP && g_grid_calibration.cells_tall < 10) {
-                    g_grid_calibration.cells_tall++;
-    //                     SDL_Log("Cell count: %dx%d", g_grid_calibration.cells_wide, g_grid_calibration.cells_tall);
-                } else if (event->key.key == SDLK_DOWN && g_grid_calibration.cells_tall > 1) {
-                    g_grid_calibration.cells_tall--;
-    //                     SDL_Log("Cell count: %dx%d", g_grid_calibration.cells_wide, g_grid_calibration.cells_tall);
-                } else if (event->key.key == SDLK_RIGHT && g_grid_calibration.cells_wide < 10) {
-                    g_grid_calibration.cells_wide++;
-    //                     SDL_Log("Cell count: %dx%d", g_grid_calibration.cells_wide, g_grid_calibration.cells_tall);
-                } else if (event->key.key == SDLK_LEFT && g_grid_calibration.cells_wide > 1) {
-                    g_grid_calibration.cells_wide--;
-    //                     SDL_Log("Cell count: %dx%d", g_grid_calibration.cells_wide, g_grid_calibration.cells_tall);
-                }
-            }
-            return;  // Don't process other keys in calibration mode
-        }
-        
-        // Tool selection (NOT allowed when token is selected - prevents accidental damage when switching modes)
-        bool has_selected_token = false;
-        for (int i = 0; i < tokens->count; i++) {
-            if (tokens->tokens[i].selected) {
-                has_selected_token = true;
-                break;
-            }
-        }
-        
-        // Allow tool switching only if not in damage input mode AND no token is selected
-        bool allow_tool_switch = !input->damage_input_mode && !has_selected_token;
-        
-        if (allow_tool_switch) {
-            if (event->key.key == SDLK_1) input->current_tool = TOOL_SELECT;
-            if (event->key.key == SDLK_2) input->current_tool = TOOL_FOG;
-            if (event->key.key == SDLK_3) input->current_tool = TOOL_SQUAD;
-            if (event->key.key == SDLK_4) input->current_tool = TOOL_DRAW;
-        }
-        
-        // Color cycling for squad/draw modes (Q and E keys)
-        if (input->current_tool == TOOL_SQUAD || input->current_tool == TOOL_DRAW) {
-            if (event->key.key == SDLK_Q) {
-                input->current_squad = (input->current_squad - 1 + SQUAD_COLOR_COUNT) % SQUAD_COLOR_COUNT;
-    //                 SDL_Log("Color: %s", SQUAD_COLORS[input->current_squad].name);
-            }
-            if (event->key.key == SDLK_E) {
-                input->current_squad = (input->current_squad + 1) % SQUAD_COLOR_COUNT;
-    //                 SDL_Log("Color: %s", SQUAD_COLORS[input->current_squad].name);
-            }
-        }
-        
-        // Shape cycling in draw mode (W key to cycle shapes)
-        if (input->current_tool == TOOL_DRAW) {
-            if (event->key.key == SDLK_W) {
-                input->current_shape = (input->current_shape == SHAPE_RECTANGLE) ? SHAPE_CIRCLE : SHAPE_RECTANGLE;
-    //             const char *shape_name = (input->current_shape == SHAPE_RECTANGLE) ? "Rectangle" : "Circle";
-    //             SDL_Log("Shape: %s", shape_name);
-            }
-            if (event->key.key == SDLK_X) {
-                drawing_clear_all(&g_drawings);
-            }
-        }
-        
-        // Delete selected token
-        if (event->key.key == SDLK_DELETE || event->key.key == SDLK_BACKSPACE) {
-            for (int i = 0; i < tokens->count; i++) {
-                if (tokens->tokens[i].selected) {
-                    token_remove(tokens, i);
-                    break;  // Only delete one token at a time
-                }
-            }
-        }
-        
-        // Toggle hidden flag on selected token
-        if (event->key.key == SDLK_H) {
-            for (int i = 0; i < tokens->count; i++) {
-                if (tokens->tokens[i].selected) {
-                    token_toggle_hidden(tokens, i);
-                    break;
-                }
-            }
-        }
-        
-        // Map cycling
-        if (event->key.key == SDLK_M) {
-            if (input->shift_pressed) {
-                map_library_prev(&g_map_library);
-            } else {
-                map_library_next(&g_map_library);
-            }
-            
-            const char *map_path = map_library_get_current(&g_map_library);
-            if (map_path) {
-                map_destroy(map);
-                if (map_load(map, map_path, wm->dm_window.renderer, wm->player_window.renderer)) {
-                    // Reinitialize fog for new map
-                    fog_destroy(fog);
-                    fog_init(fog, map->grid_cols, map->grid_rows);
-    //                     SDL_Log("Loaded map: %s", map->name);
-                }
-            }
-        }
-        
-        // Grid calibration mode
-        if (event->key.key == SDLK_C && !g_grid_calibration.active) {
-            grid_calibration_start(&g_grid_calibration);
-        }
-        
-        // Grid toggle
-        if (event->key.key == SDLK_G) {
-            input->show_grid = !input->show_grid;
-    //             SDL_Log("Grid overlay: %s", input->show_grid ? "ON" : "OFF");
-        }
-        
-        // View sync toggle
-        if (event->key.key == SDLK_P) {
-            g_sync_views = !g_sync_views;
-    //             SDL_Log("View sync: %s", g_sync_views ? "ON" : "OFF");
-        }
-        
-        // Token resizing with +/-
-        if (event->key.key == SDLK_EQUALS || event->key.key == SDLK_KP_PLUS) {
-            for (int i = 0; i < tokens->count; i++) {
-                if (tokens->tokens[i].selected) {
-                    token_resize(tokens, i, +1);
-                    break;
-                }
-            }
-        }
-        if (event->key.key == SDLK_MINUS || event->key.key == SDLK_KP_MINUS) {
-            for (int i = 0; i < tokens->count; i++) {
-                if (tokens->tokens[i].selected) {
-                    token_resize(tokens, i, -1);
-                    break;
-                }
-            }
-        }
-        
-        // Damage tracking with number keys 1-9 and 0
-        // 1-9: Add damage, Shift+1-9: Heal (subtract damage)
-        // 0: Add 10 damage, Shift+0: Heal 10
-        if (event->key.key >= SDLK_1 && event->key.key <= SDLK_9) {
-            int damage_change = (event->key.key - SDLK_0);
-            if (input->shift_pressed) {
-                damage_change = -damage_change;  // Heal
-            }
-            
-            for (int i = 0; i < tokens->count; i++) {
-                if (tokens->tokens[i].selected) {
-                    tokens->tokens[i].damage += damage_change;
-                    if (tokens->tokens[i].damage < 0) {
-                        tokens->tokens[i].damage = 0;  // Can't heal below 0
-                    }
-    //                     SDL_Log("Token %s damage: %d", tokens->tokens[i].name, tokens->tokens[i].damage);
-                    break;
-                }
-            }
-        }
-        
-        if (event->key.key == SDLK_0) {
-            int damage_change = 10;
-            if (input->shift_pressed) {
-                damage_change = -10;  // Heal
-            }
-            
-            for (int i = 0; i < tokens->count; i++) {
-                if (tokens->tokens[i].selected) {
-                    tokens->tokens[i].damage += damage_change;
-                    if (tokens->tokens[i].damage < 0) {
-                        tokens->tokens[i].damage = 0;  // Can't heal below 0
-                    }
-    //                     SDL_Log("Token %s damage: %d", tokens->tokens[i].name, tokens->tokens[i].damage);
-                    break;
-                }
-            }
-        }
-        
-        // Close condition wheel with ESC
-        if (event->key.key == SDLK_ESCAPE && input->condition_wheel_open) {
-            input->condition_wheel_open = false;
-            input->condition_wheel_token_index = -1;
-    //             SDL_Log("Condition wheel closed");
-            return;  // Don't process other ESC actions
-        }
-        
-        // Deselect all (only if not in damage input mode - that's handled above)
-        if (event->key.key == SDLK_ESCAPE && !input->damage_input_mode) {
-            token_deselect_all(tokens);
-        }
-        
-        // F1-F12 save/load
-        if (event->key.key >= SDLK_F1 && event->key.key <= SDLK_F12) {
-            int slot = (event->key.key - SDLK_F1) + 1;
-            if (input->shift_pressed) {
-                save_to_slot(slot, map, tokens, fog, input, camera);
-            } else {
-                load_from_slot(slot, map, tokens, fog, input,
-                               wm->dm_window.renderer, wm->player_window.renderer, camera);
-            }
-        }
-    }
-    
-    if (event->type == SDL_EVENT_KEY_UP) {
-        input->shift_pressed = (event->key.mod & SDL_KMOD_SHIFT) != 0;
-        input->ctrl_pressed = (event->key.mod & SDL_KMOD_CTRL) != 0;
     }
 }
 
-bool input_handle_events(WindowManager *wm, InputState *input, TokenManager *tokens,
-                         FogOfWar *fog, Map *map, Camera *camera) {
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-        switch (event.type) {
-            case SDL_EVENT_QUIT:
-            return false;
-            
-            case SDL_EVENT_WINDOW_CLOSE_REQUESTED: {
-                WindowState *win = window_manager_get_window_by_id(wm, event.window.windowID);
-                if (win) {
-                    win->is_open = false;
-                    if (!wm->dm_window.is_open && !wm->player_window.is_open) {
-                        return false;
-                    }
-                }
-                break;
-            }
-            
-            case SDL_EVENT_MOUSE_BUTTON_DOWN:
-            case SDL_EVENT_MOUSE_BUTTON_UP:
-            case SDL_EVENT_MOUSE_MOTION: {
-                WindowState *win = window_manager_get_window_by_id(wm, event.button.windowID);
-                if (win && win->type == WINDOW_TYPE_DM) {
-                    input_handle_camera(camera, input, &event, map->width, map->height, win->window);
-                    input_handle_dm_mouse(camera, input, tokens, fog, map, &event);
-                }
-                break;
-            }
-            
-            case SDL_EVENT_MOUSE_WHEEL: {
-                WindowState *win = window_manager_get_window_by_id(wm, event.wheel.windowID);
-                if (win && win->type == WINDOW_TYPE_DM) {
-                    input_handle_camera(camera, input, &event, map->width, map->height, win->window);
-                }
-                break;
-            }
-            
-            case SDL_EVENT_KEY_DOWN:
-            case SDL_EVENT_KEY_UP:
-            input_handle_keyboard(camera, input, map, tokens, fog, wm, &event);
-            break;
-            
-            case SDL_EVENT_DROP_FILE: {
-                WindowState *win = window_manager_get_window_by_id(wm, event.drop.windowID);
-                if (win && win->type == WINDOW_TYPE_DM) {
-                    const char *dropped_file = event.drop.data;
-                    if (is_image_file(dropped_file)) {
-                        float mouse_x, mouse_y;
-                        SDL_GetMouseState(&mouse_x, &mouse_y);
-                        int grid_x, grid_y;
-                        float cam_x = camera->x;
-                        float cam_y = camera->y;
-                        float zoom = camera->zoom;
-                        grid_screen_to_grid_direct(mouse_x, mouse_y,
-                                                   cam_x, cam_y, zoom,
-                                                   map->grid_size,
-                                                   map->grid_offset_x, map->grid_offset_y,
-                                                   &grid_x, &grid_y);
-                        char token_name[64];
-                        char rel_path[256];
-                        strncpy(rel_path, dropped_file, sizeof(rel_path) - 1);
-                        make_path_relative(rel_path, sizeof(rel_path));
-                        normalize_path_slashes(rel_path);
-                        extract_filename(rel_path, token_name, sizeof(token_name));
-                        token_add(tokens, rel_path, grid_x, grid_y,
-                                  wm->dm_window.renderer, wm->player_window.renderer,
-                                  token_name);
-    //                         SDL_Log("Token added: %s at grid (%d, %d)", token_name, grid_x, grid_y);
-                    }
-                }
-                break;
-            }
-        }
-    }
-    return true;
-}
-
-// ============================================================================
-// MAIN LOOP
-// ============================================================================
-
-int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
     
-    if (!window_manager_init(&g_wm)) {
-        return 1;
+    SDL_Init(SDL_INIT_VIDEO);
+    
+    g.dm.win = SDL_CreateWindow("DM View", 1280, 720, SDL_WINDOW_RESIZABLE);
+    g.player.win = SDL_CreateWindow("Player View", 1280, 720, SDL_WINDOW_RESIZABLE);
+    g.dm.ren = SDL_CreateRenderer(g.dm.win, NULL);
+    g.player.ren = SDL_CreateRenderer(g.player.win, NULL);
+    g.dm.id = SDL_GetWindowID(g.dm.win);
+    g.player.id = SDL_GetWindowID(g.player.win);
+    
+    FILE *f = fopen("font.ttf", "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        g.font_data = malloc(sz);
+        fseek(f, 0, SEEK_SET);
+        fread(g.font_data, 1, sz, f);
+        fclose(f);
+        stbtt_InitFont(&g.font, g.font_data, stbtt_GetFontOffsetForIndex(g.font_data, 0));
     }
     
-    // Load font for damage numbers
-    if (!font_load("font.ttf")) {
-    //         SDL_Log("Warning: Could not load font.ttf - damage numbers will not be displayed");
+    SDL_Color white = {255, 255, 255, 255};
+    const char *cond_abbrev[] = {"BL","DA","FR","GR","RE","SL","TA","WE"};
+    const char *cond_names[] = {"Bleeding","Dazed","Frightened","Grabbed","Restrained","Slowed","Taunted","Weakened"};
+    for (int i = 0; i < COND_COUNT; i++) {
+        g.cond_tex[0][i] = bake_text_once(g.dm.ren, cond_abbrev[i], &g.cond_w, &g.cond_h, white, 16.0f);
+        g.cond_tex[1][i] = bake_text_once(g.player.ren, cond_abbrev[i], &g.cond_w, &g.cond_h, white, 16.0f);
+        int dummy_w, dummy_h;
+        g.cond_wheel_tex[i] = bake_text_once(g.dm.ren, cond_names[i], &dummy_w, &dummy_h, white, 16.0f);
     }
     
-    // Initialize asset libraries
-    map_library_init(&g_map_library);
-    token_library_init(&g_token_library);
-    grid_calibration_init(&g_grid_calibration);
+    scan_assets("assets/maps", g.map_assets, &g.map_count);
+    scan_assets("assets/tokens", g.token_lib, &g.token_lib_count);
     
-    // Initialize map cache and preload all maps
-    map_cache_init(&g_map_cache, &g_map_library);
-    map_cache_preload(&g_map_cache, &g_map_library);
-    
-    map_init(&g_map);
-    token_manager_init(&g_tokens);
-    drawing_manager_init(&g_drawings);
-    input_init(&g_input);
-    
-    // Load first map from library if available, otherwise try default
-    const char *first_map = map_library_get_current(&g_map_library);
-    if (first_map) {
-        if (!map_load(&g_map, first_map, g_wm.dm_window.renderer, g_wm.player_window.renderer)) {
-    //             SDL_Log("Failed to load map from library: %s", first_map);
-        }
-    } else {
-        // Try to load a default map if it exists (supports PNG, JPEG, BMP, etc.)
-        if (!map_load(&g_map, "assets/maps/test_map.png", g_wm.dm_window.renderer, g_wm.player_window.renderer)) {
-            // Try JPEG if PNG doesn't exist
-            if (!map_load(&g_map, "assets/maps/test_map.jpg", g_wm.dm_window.renderer, g_wm.player_window.renderer)) {
-                map_load(&g_map, "assets/maps/test_map.jpeg", g_wm.dm_window.renderer, g_wm.player_window.renderer);
-            }
-        }
+    if (g.map_count > 0) {
+        // Only load the first map on startup for faster loading
+        g.map_current = 0;
+        load_asset_to_both(g.map_assets[0].path, &g.map_assets[0]);
+        g.map_w = g.map_assets[0].w;
+        g.map_h = g.map_assets[0].h;
+        g.grid_size = 64;
+        g.grid_off_x = g.grid_off_y = 0;
+        fog_init((g.map_w+64)/64, (g.map_h+64)/64);
     }
     
-    // Initialize fog of war
-    if (g_map.grid_cols > 0 && g_map.grid_rows > 0) {
-        fog_init(&g_fog, g_map.grid_cols, g_map.grid_rows);
-    }
+    g.cam[0].target_zoom = g.cam[1].target_zoom = 1.0f;
+    g.current_squad = 0;
+    g.current_shape = SHAPE_RECT;
+    g.tool = TOOL_SELECT;
+    g.show_grid = true;
+    g.sync_views = true;
+    g.cached_tool = TOOL_FOG;
     
-    // Initialize cameras after map is loaded
-    camera_init(&g_dm_camera, g_map.width, g_map.height, WINDOW_DM_WIDTH, WINDOW_DM_HEIGHT);
+    printf("VTT started. Controls:\n");
+    printf("  1 - Select tool, 2 - Fog tool, 3 - Squad assignment tool, 4 - Draw tool\n");
+    printf("  Left click - Select/move tokens, toggle fog, assign squad, or draw shapes\n");
+    printf("  Right click - Pan camera (drag) / Delete drawing (middle-click in draw mode)\n");
+    printf("  Mouse Wheel - Zoom in/out at cursor\n");
+    printf("  W - Cycle shape (in draw mode)\n");
+    printf("  Q/E - Cycle colors (in squad/draw mode)\n");
+    printf("  A - Open condition wheel for selected token\n");
+    printf("  D - Toggle token opacity (50%% downed / 100%% normal)\n");
+    printf("  SHIFT+D - Reset all token opacities to 100%%\n");
+    printf("  X - Clear all drawings (in draw mode)\n");
+    printf("  P - Toggle player view sync to DM view\n");
+    printf("  G - Toggle grid overlay\n");
+    printf("  M - Cycle to next map, SHIFT+M - Previous map\n");
+    printf("  C - Enter grid calibration mode\n");
+    printf("  H - Toggle selected token hidden/visible\n");
+    printf("  +/- - Resize selected token\n");
+    printf("  1-9 - Add damage to selected token\n");
+    printf("  SHIFT+1-9 - Heal (subtract damage) from selected token\n");
+    printf("  0 - Add 10 damage to selected token\n");
+    printf("  SHIFT+0 - Heal 10 damage from selected token\n");
+    printf("  ENTER - Type multi-digit damage (Hold SHIFT to heal)\n");
+    printf("  DELETE/BACKSPACE - Remove selected token\n");
+    printf("  Drag & Drop - Drop image files onto DM window to add tokens\n");
+    printf("  SHIFT+F1-F12 - Save to slot\n");
+    printf("  F1-F12 - Load from slot\n");
+    printf("  ESC - Deselect all / Cancel damage input / Close condition wheel\n");
     
-    int player_win_width, player_win_height;
-    SDL_GetWindowSize(g_wm.player_window.window, &player_win_width, &player_win_height);
-    camera_init(&g_player_camera, g_map.width, g_map.height, player_win_width, player_win_height);
-    
-    // Try to load a default token if it exists (supports PNG, JPEG, BMP, etc.)
-    if (!token_add(&g_tokens, "assets/tokens/warrior.png", 5, 5,
-                   g_wm.dm_window.renderer, g_wm.player_window.renderer, "Warrior")) {
-        // Try JPEG if PNG doesn't exist
-        if (!token_add(&g_tokens, "assets/tokens/warrior.jpg", 5, 5,
-                       g_wm.dm_window.renderer, g_wm.player_window.renderer, "Warrior")) {
-            token_add(&g_tokens, "assets/tokens/warrior.jpeg", 5, 5,
-                      g_wm.dm_window.renderer, g_wm.player_window.renderer, "Warrior");
+    while (1) {
+        handle_input();
+        
+        cam_update(&g.cam[0]);
+        if (g.sync_views) {
+            g.cam[1].target_x = g.cam[0].target_x;
+            g.cam[1].target_y = g.cam[0].target_y;
+            g.cam[1].target_zoom = g.cam[0].target_zoom;
         }
-    }
-    
-    SDL_Log("VTT started. Controls:");
-    SDL_Log("  1 - Select tool, 2 - Fog tool, 3 - Squad assignment tool, 4 - Draw tool");
-    SDL_Log("      (Note: Cannot switch tools when a token is selected - deselect first)");
-    SDL_Log("  Left click - Select/move tokens, toggle fog, assign squad, or draw shapes");
-    SDL_Log("  Right click - Pan camera (drag) / Delete drawing (in draw mode)");
-    SDL_Log("  Mouse Wheel - Zoom in/out at cursor");
-    SDL_Log("  W - Cycle shape (in draw mode)");
-    SDL_Log("  Q/E - Cycle colors (in squad/draw mode)");
-    SDL_Log("  A - Open condition wheel for selected token");
-    SDL_Log("  D - Toggle token opacity (50%% downed / 100%% normal)");
-    SDL_Log("  SHIFT+D - Reset all token opacities to 100%%");
-    SDL_Log("  X - Clear all drawings (in draw mode)");
-    SDL_Log("  P - Toggle player view sync to DM view");
-    SDL_Log("  M - Cycle to next map, SHIFT+M - Previous map");
-    SDL_Log("  CTRL+C - Enter grid calibration mode");
-    SDL_Log("  G - Toggle grid overlay");
-    SDL_Log("  H - Toggle selected token hidden/visible");
-    SDL_Log("  +/- - Resize selected token");
-    SDL_Log("  1-9 - Add damage to selected token");
-    SDL_Log("  SHIFT+1-9 - Heal (subtract damage) from selected token");
-    SDL_Log("  0 - Add 10 damage to selected token");
-    SDL_Log("  SHIFT+0 - Heal 10 damage from selected token");
-    SDL_Log("  ENTER - Type multi-digit damage (e.g. ENTER > 15 > ENTER adds 15 damage)");
-    SDL_Log("          Hold SHIFT while typing to heal instead");
-    SDL_Log("  DELETE/BACKSPACE - Remove selected token");
-    SDL_Log("  Drag & Drop - Drop image files onto DM window to add tokens");
-    SDL_Log("  SHIFT+F1-F12 - Save to slot");
-    SDL_Log("  F1-F12 - Load from slot");
-    SDL_Log("  ESC - Deselect all / Cancel damage input / Close condition wheel");
-    
-    bool running = true;
-    while (running) {
-        running = input_handle_events(&g_wm, &g_input, &g_tokens, &g_fog, &g_map, &g_dm_camera);
+        cam_update(&g.cam[1]);
         
-        // Update camera view sizes
-        int dm_width, dm_height;
-        SDL_GetWindowSize(g_wm.dm_window.window, &dm_width, &dm_height);
-        g_dm_camera.view_width = dm_width;
-        g_dm_camera.view_height = dm_height;
-        
-        int player_width, player_height;
-        SDL_GetWindowSize(g_wm.player_window.window, &player_width, &player_height);
-        g_player_camera.view_width = player_width;
-        g_player_camera.view_height = player_height;
-        
-        // Update cameras
-        camera_update(&g_dm_camera);
-        
-        // Sync views if enabled
-        if (g_sync_views) {
-            camera_sync(&g_player_camera, &g_dm_camera, g_map.width, g_map.height);
-        }
-        camera_update(&g_player_camera);
-        
-        if (g_wm.dm_window.is_open) {
-            renderer_render_dm(&g_wm.dm_window, &g_map, &g_tokens, &g_fog, &g_input, &g_dm_camera);
-        }
-        
-        if (g_wm.player_window.is_open) {
-            renderer_render_player(&g_wm.player_window, &g_map, &g_tokens, &g_fog, &g_player_camera);
-        }
+        render_view(0);
+        render_view(1);
         
         SDL_Delay(16);
     }
-    
-    fog_destroy(&g_fog);
-    token_manager_destroy(&g_tokens);
-    map_destroy(&g_map);
-    map_cache_destroy(&g_map_cache);
-    font_cleanup();
-    window_manager_destroy(&g_wm);
     
     return 0;
 }
