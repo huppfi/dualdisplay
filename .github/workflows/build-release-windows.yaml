@@ -34,18 +34,37 @@ jobs:
 
       - name: Build vtt.exe
         run: |
-          # Create directories (same as your bat)
+          # Create directories
           mkdir -p assets/maps assets/tokens saves
 
-          # Compile (adapted from your build.bat)
-          gcc -Wall -Wextra -O2 -std=c11 main.c -o vtt.exe \
+          # Step 1: Compile STB libraries (one-time)
+          echo "Compiling STB libraries..."
+          gcc -c -O2 -std=c11 stb_impl.c -o stb_impl.o
+
+          # Step 2: Compile main.c and link with STB
+          echo "Compiling main.c..."
+          gcc -Wall -Wextra -O2 -std=c11 main.c stb_impl.o -o vtt.exe \
             -I/mingw64/include/SDL3 \
             -L/mingw64/lib \
             -lSDL3 -lm
 
-      - name: Bundle SDL3.dll
+      - name: Bundle SDL3.dll, font, and prepare release structure
         run: |
+          # Copy SDL3.dll
           cp /mingw64/bin/SDL3.dll .
+          
+          # Check for font
+          if [ ! -f font.ttf ]; then
+            echo "Warning: font.ttf not found in repo - will use system fonts"
+          fi
+          
+          # Create empty asset directories so users don't have to
+          mkdir -p assets/maps
+          mkdir -p assets/tokens
+          
+          # Add README files to asset folders
+          echo "Place your map images here (.png, .jpg, .bmp)" > assets/maps/README.txt
+          echo "Place your token images here (.png, .jpg, .bmp)" > assets/tokens/README.txt
       
       - name: Upload artifact (for debugging)
         uses: actions/upload-artifact@v4
@@ -54,9 +73,21 @@ jobs:
           path: |
             vtt.exe
             SDL3.dll
+            font.ttf
+            assets/
       
-      - name: Zip the executable
-        run: zip vtt-windows-x64.zip vtt.exe SDL3.dll
+      - name: Zip the release package
+        run: |
+          # Create comprehensive release package
+          if [ -f font.ttf ]; then
+            zip -r vtt-windows-x64.zip vtt.exe SDL3.dll font.ttf assets/
+          else
+            zip -r vtt-windows-x64.zip vtt.exe SDL3.dll assets/
+            echo "Note: font.ttf not included (will use system fonts)"
+          fi
+          
+          echo "Release package created with:"
+          unzip -l vtt-windows-x64.zip
       
       - name: Create GitHub Release + attach EXE
         uses: softprops/action-gh-release@v2

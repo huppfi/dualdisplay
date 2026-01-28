@@ -17,6 +17,11 @@
 #include "stb_image.h"
 #include "stb_truetype.h"
 #include "stb_image_write.h"
+
+// Try to include embedded font if available (optional)
+#ifdef EMBED_FONT
+#include "font_embedded.h"
+#endif
 extern unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, int stride_bytes, int x, int y, int n, int *out_len);
 
 #define ARRAY_COUNT(x) (sizeof(x)/sizeof((x)[0]))
@@ -333,14 +338,27 @@ static void render_token(SDL_Renderer *r, Token *t, const Camera *c, int view) {
         SDL_SetRenderDrawColor(r, 255, 255, 0, 255);
         SDL_RenderRect(r, &(SDL_FRect){sx, sy, sw, sh});
     }
+}
+
+static void render_token_markers(SDL_Renderer *r, Token *t, const Camera *c, int view) {
+    if (t->hidden && view == 1) return;
+    int gx = t->grid_x * g.grid_size + g.grid_off_x;
+    int gy = t->grid_y * g.grid_size + g.grid_off_y;
+    Asset *img = &g.token_lib[t->image_idx];
+    if (!img->loaded) return;
+    float scale = (g.grid_size * t->size) / (float)img->w * c->zoom;
+    float sw = img->w * scale, sh = img->h * scale;
+    float sx = (gx - c->x) * c->zoom;
+    float sy = (gy - c->y) * c->zoom - (sh - g.grid_size * c->zoom);
     
+    // Damage number at top center
     if (t->damage > 0) {
         if (!t->damage_tex[view] || t->cached_dmg[view] != t->damage) {
             if (t->damage_tex[view]) SDL_DestroyTexture(t->damage_tex[view]);
             char buf[16]; snprintf(buf, 16, "%d", t->damage);
             SDL_Color white = {255, 255, 255, 255};
             int w, h;
-            t->damage_tex[view] = bake_text_once(r, buf, &w, &h, white, 16.0f);
+            t->damage_tex[view] = bake_text_once(r, buf, &w, &h, white, 20.0f);
             t->cached_dmg[view] = t->damage;
         }
         if (t->damage_tex[view]) {
@@ -353,49 +371,56 @@ static void render_token(SDL_Renderer *r, Token *t, const Camera *c, int view) {
         }
     }
     
-    // Render conditions stacked vertically upward on the left side
-    // Tag size scales with token size AND camera zoom (in screen space)
-    float token_scale = t->size;  // 1-4 based on token grid size
+    // Condition tags - bigger, inside token bounds, growing upward from bottom
+    float token_scale = t->size;
     
     static const SDL_Color cond_colors[COND_COUNT] = {
         {220,20,20,255}, {255,215,0,255}, {147,51,234,255}, {255,140,0,255},
         {139,69,19,255}, {30,144,255,255}, {255,20,147,255}, {50,205,50,255}
     };
     
-    // Scale everything by both token size and camera zoom for proper screen space rendering
-    float padding = 4.0f * token_scale * c->zoom;
-    float tag_width = 24.0f * token_scale * c->zoom;
-    float tag_height = 18.0f * token_scale * c->zoom;
+    // Make tags bigger - CHANGE base_font_size TO ADJUST BOX SIZE (text scales independently below)
+    float padding = 3.0f * c->zoom;
+    float base_font_size = 32.0f;  // <-- CHANGE THIS VALUE to resize condition tag BOXES
+    float tag_width = base_font_size * 2.5f * c->zoom;
+    float tag_height = base_font_size * 1.4f * c->zoom;
     
-    // Position tags at bottom-left of token, growing upward
-    float tag_x = sx - sw/2 + tag_width * 0.6f;
-    float tag_y = sy + sh - tag_height - padding;
+    // Start from bottom of token, inside bounds, grow upward
+    float tag_x = sx + padding;
+    float tag_y = sy + sh - tag_height - padding * 2;
     
     for (int i = 0; i < COND_COUNT; i++) {
         if (!t->cond[i]) continue;
         
         SDL_Color col = cond_colors[i];
         
+        // Ensure tag stays inside token bounds
+        if (tag_y < sy + padding) break; // Stop if we run out of space
+        
         // Background with condition color
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-        SDL_FRect tag_bg = {tag_x - padding, tag_y - padding, tag_width + padding*2, tag_height + padding*2};
-        SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 220);
+        SDL_FRect tag_bg = {tag_x, tag_y, tag_width + padding*2, tag_height + padding*2};
+        SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 230);
         SDL_RenderFillRect(r, &tag_bg);
         
         // Border
         SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
         SDL_RenderRect(r, &tag_bg);
         
-        // Text - scale by both token size and camera zoom
+        // Text - larger than box (text is baked at 16.0f)
         if (g.cond_tex[view][i]) {
-            float text_w = g.cond_w * token_scale * c->zoom;
-            float text_h = g.cond_h * token_scale * c->zoom;
-            SDL_FRect text_dst = {tag_x + (tag_width - text_w) / 2, tag_y + (tag_height - text_h) / 2, text_w, text_h};
+            // CHANGE text_size_multiplier TO ADJUST TEXT SIZE (independent of box size)
+            float text_size_multiplier = 2.0f;  // <-- CHANGE THIS to make text bigger/smaller
+            float text_w = g.cond_w * c->zoom * text_size_multiplier;
+            float text_h = g.cond_h * c->zoom * text_size_multiplier;
+            SDL_FRect text_dst = {tag_x + padding + (tag_width - text_w) / 2, 
+                                  tag_y + padding + (tag_height - text_h) / 2, 
+                                  text_w, text_h};
             SDL_RenderTexture(r, g.cond_tex[view][i], NULL, &text_dst);
         }
         
         // Move up for next tag
-        tag_y -= tag_height + padding * 2;
+        tag_y -= tag_height + padding * 3;
     }
 }
 
@@ -416,6 +441,7 @@ static void render_view(int view) {
         }
     }
     
+    // Z-Layer: Grid (optional overlay)
     if (view == 0 && g.show_grid) {
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(r, 100, 100, 100, 100);
@@ -433,11 +459,7 @@ static void render_view(int view) {
         }
     }
     
-    for (int i = 0; i < g.token_count; i++) {
-        if (view == 1 && !fog_get(g.tokens[i].grid_x, g.tokens[i].grid_y)) continue;
-        render_token(r, &g.tokens[i], c, view);
-    }
-    
+    // Z-Layer: Drawings (below tokens)
     static const SDL_Color cols[8] = {
         {255,50,50,128},{50,150,255,128},{50,255,50,128},{255,255,50,128},
         {255,150,50,128},{200,50,255,128},{50,255,255,128},{255,255,255,128}
@@ -461,6 +483,12 @@ static void render_view(int view) {
             SDL_Color b = {col.r, col.g, col.b, 255};
             render_circle(r, (x1+x2)/2, (y1+y2)/2, rad, false, b);
         }
+    }
+    
+    // Z-Layer: Tokens (without damage/conditions)
+    for (int i = 0; i < g.token_count; i++) {
+        if (view == 1 && !fog_get(g.tokens[i].grid_x, g.tokens[i].grid_y)) continue;
+        render_token(r, &g.tokens[i], c, view);
     }
     
     if (view == 0 && g.draw_shape) {
@@ -488,6 +516,7 @@ static void render_view(int view) {
         }
     }
     
+    // Z-Layer: Fog of War
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(r, 0, 0, 0, view == 0 ? 180 : 255);
     int sc = (c->x - g.grid_off_x) / g.grid_size;
@@ -509,6 +538,12 @@ static void render_view(int view) {
                 SDL_RenderFillRect(r, &cell);
             }
         }
+    }
+    
+    // Z-Layer: Damage and Condition Markers (topmost layer for tokens)
+    for (int i = 0; i < g.token_count; i++) {
+        if (view == 1 && !fog_get(g.tokens[i].grid_x, g.tokens[i].grid_y)) continue;
+        render_token_markers(r, &g.tokens[i], c, view);
     }
     
     if (view == 0 && g.cal_active && g.cal_drag) {
@@ -683,6 +718,23 @@ static void render_view(int view) {
 }
 
 // Helper for saving embedded PNG data
+// Helper struct for PNG writing
+typedef struct {
+    unsigned char *data;
+    int size;
+    int capacity;
+} PNGBuffer;
+
+static void png_write_callback(void *context, void *data, int size) {
+    PNGBuffer *buf = (PNGBuffer*)context;
+    if (buf->size + size > buf->capacity) {
+        buf->capacity = (buf->size + size) * 2;
+        buf->data = realloc(buf->data, buf->capacity);
+    }
+    memcpy(buf->data + buf->size, data, size);
+    buf->size += size;
+}
+
 static void write_embedded_asset(FILE *f, Asset *asset) {
     ensure_asset_loaded(asset);
     
@@ -695,17 +747,20 @@ static void write_embedded_asset(FILE *f, Asset *asset) {
     int w, h;
     unsigned char *data = stbi_load(asset->path, &w, &h, NULL, 4);
     if (data) {
-        // Write PNG to memory for compression
-        int png_len;
-        unsigned char *png_data = stbi_write_png_to_mem(data, w * 4, w, h, 4, &png_len);
-        if (png_data) {
-            fwrite(&png_len, 4, 1, f);
-            fwrite(png_data, 1, png_len, f);
-            free(png_data);
+        // Write PNG to memory buffer using callback
+        PNGBuffer buf = {0};
+        buf.capacity = w * h * 4;
+        buf.data = malloc(buf.capacity);
+        
+        if (stbi_write_png_to_func(png_write_callback, &buf, w, h, 4, data, w * 4)) {
+            fwrite(&buf.size, 4, 1, f);
+            fwrite(buf.data, 1, buf.size, f);
         } else {
             int zero = 0;
             fwrite(&zero, 4, 1, f);
         }
+        
+        free(buf.data);
         stbi_image_free(data);
     } else {
         int zero = 0;
@@ -1241,15 +1296,65 @@ int main(int argc, char **argv) {
     g.dm.id = SDL_GetWindowID(g.dm.win);
     g.player.id = SDL_GetWindowID(g.player.win);
     
-    FILE *f = fopen("font.ttf", "rb");
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        long sz = ftell(f);
-        g.font_data = malloc(sz);
-        fseek(f, 0, SEEK_SET);
-        fread(g.font_data, 1, sz, f);
-        fclose(f);
-        stbtt_InitFont(&g.font, g.font_data, stbtt_GetFontOffsetForIndex(g.font_data, 0));
+    // Load font: try embedded first, then file, then system fonts
+    bool font_loaded = false;
+    
+    #ifdef EMBED_FONT
+    // Use embedded font data (compiled into executable)
+    g.font_data = malloc(embedded_font_size);
+    if (g.font_data) {
+        memcpy(g.font_data, embedded_font_data, embedded_font_size);
+        if (stbtt_InitFont(&g.font, g.font_data, stbtt_GetFontOffsetForIndex(g.font_data, 0))) {
+            font_loaded = true;
+            printf("Using embedded font\n");
+        } else {
+            free(g.font_data);
+            g.font_data = NULL;
+        }
+    }
+    #endif
+    
+    // Fallback to font files if no embedded font
+    if (!font_loaded) {
+        const char *font_paths[] = {
+            "font.ttf",  // Local font
+            #ifdef _WIN32
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/calibri.ttf",
+            "C:/Windows/Fonts/segoeui.ttf",
+            #else
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",  // macOS
+            #endif
+        };
+        
+        FILE *f = NULL;
+        const char *loaded_path = NULL;
+        for (int i = 0; i < (int)ARRAY_COUNT(font_paths) && !f; i++) {
+            f = fopen(font_paths[i], "rb");
+            if (f) loaded_path = font_paths[i];
+        }
+        
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            g.font_data = malloc(sz);
+            fseek(f, 0, SEEK_SET);
+            fread(g.font_data, 1, sz, f);
+            fclose(f);
+            if (stbtt_InitFont(&g.font, g.font_data, stbtt_GetFontOffsetForIndex(g.font_data, 0))) {
+                font_loaded = true;
+                printf("Using font: %s\n", loaded_path);
+            }
+        }
+    }
+    
+    if (!font_loaded) {
+        printf("Warning: No font found. Text rendering will be disabled.\n");
+        printf("To embed a font: python embed_font.py font.ttf > font_embedded.h\n");
+        printf("Then compile with: -DEMBED_FONT\n");
     }
     
     SDL_Color white = {255, 255, 255, 255};

@@ -12,9 +12,17 @@
 # Logs and temporary files
 *.log
 *.txt
+errors.txt
 build_output.txt
 compile_output.txt
 nul
+
+# But DO track font.ttf if you want it in releases
+!font.ttf
+
+# Track documentation images
+!docs/
+!docs/images/
 
 # Save files
 saves/

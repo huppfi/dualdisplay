@@ -2,25 +2,57 @@
 
 A dual-window virtual tabletop application for managing game maps, tokens, fog of war, and battle conditions. Built with SDL3 in C.
 
+![VTT Overview](docs/images/vtt-overview.jpg)
+
 ## Features
 
-- Dual window display (DM view and player view)
-- Map and token management with drag and drop support
-- Fog of war system with painting tools
-- Token damage tracking
-- Status condition system with visual indicators
-- Squad/group color assignment
-- Drawing tools (rectangles and circles)
-- Save/load system (F1-F12 slots)
-- Grid calibration for different map sizes
-- Camera controls with zoom and pan
+### 🎮 Dual Window Display
+Separate DM and player views with synchronized or independent camera controls.
+
+### 🗺️ Map & Token Management
+- Drag and drop support for tokens
+- Multiple maps with quick switching (M key)
+- Token resizing and repositioning
+- Copy tokens with Shift/Ctrl + drag
+
+![Token Management](docs/images/token-management.gif)
+
+### 🌫️ Fog of War System
+Paint and reveal fog of war with intuitive brush controls. Players only see revealed areas.
+
+![Fog of War](docs/images/fog-of-war.gif)
+
+### 💔 Damage Tracking
+Quick damage application with visual indicators. Supports single digit (1-9), batch (0 for 10), and custom amounts.
+
+![Damage Tracking](docs/images/damage-tracking.gif)
+
+### 🎯 Status Condition System
+8 built-in conditions with color-coded visual indicators:
+- **Bleeding** (Red) • **Dazed** (Gold) • **Frightened** (Purple) • **Grabbed** (Orange)
+- **Restrained** (Brown) • **Slowed** (Blue) • **Taunted** (Pink) • **Weakened** (Green)
+
+![Condition Wheel](docs/images/condition-wheel.gif)
+
+### 🎨 Squad Assignment & Drawing Tools
+Group tokens with color-coded borders. Draw tactical markers (rectangles/circles) for planning.
+
+![Squad and Drawing](docs/images/squad-drawing.gif)
+
+### 💾 Save/Load System
+Portable .vtt save files with embedded assets
+
+### 📐 Grid Calibration
+Align the grid to any map size with visual calibration tool.
+
+![Grid Calibration](docs/images/grid-calibration.gif)
 
 ## Requirements
 
 - SDL3 library
 - GCC compiler
 - TrueType font file (font.ttf)
-- assets/maps/ Folder in the directory of the Executable. It loads all Maps (JPEG or PNG) in that folder on startup. 
+- Maps in assets/maps/ Folder in the directory of the Executable. It loads all Maps (JPEG or PNG) in that folder on startup. 
 ## Building
 
 ### Windows (MSYS2/MinGW)
@@ -111,10 +143,6 @@ The wheel displays 8 conditions:
 - Weakened (Green)
 
 Active conditions appear grayed out in the wheel and display as colored 2-letter tags on tokens.
-
-## Configuration
-
-Adjust wheel size by changing `CONDITION_WHEEL_SCALE` in main.c (default 1.0).
 
 ## License
 
