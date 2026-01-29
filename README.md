@@ -103,6 +103,12 @@ chmod +x build.sh
 - X - Clear all drawings
 - Right click - Delete drawing (in draw mode)
 
+### Measurement Tool
+- Alt+Click - Start measurement from clicked grid cell
+- Move mouse - See preview line with distance
+- Left Click - End measurement
+- Esc - Cancel measurement
+
 ### Camera
 - Right click + drag - Pan camera
 - Mouse wheel - Zoom in/out at cursor

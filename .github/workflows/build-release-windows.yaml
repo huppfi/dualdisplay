@@ -48,10 +48,11 @@ jobs:
             -L/mingw64/lib \
             -lSDL3 -lm -static-libgcc -static-libstdc++
 
-      - name: Bundle SDL3.dll, font, and prepare release structure
+      - name: Bundle required DLLs, font, and prepare release structure
         run: |
-          # Copy SDL3.dll
+          # Copy required DLLs
           cp /mingw64/bin/SDL3.dll .
+          cp /mingw64/bin/libwinpthread-1.dll .
           
           # Check for font
           if [ ! -f font.ttf ]; then
@@ -73,6 +74,7 @@ jobs:
           path: |
             vtt.exe
             SDL3.dll
+            libwinpthread-1.dll
             font.ttf
             assets/
       
@@ -80,9 +82,9 @@ jobs:
         run: |
           # Create comprehensive release package
           if [ -f font.ttf ]; then
-            zip -r vtt-windows-x64.zip vtt.exe SDL3.dll font.ttf assets/
+            zip -r vtt-windows-x64.zip vtt.exe SDL3.dll libwinpthread-1.dll font.ttf assets/
           else
-            zip -r vtt-windows-x64.zip vtt.exe SDL3.dll assets/
+            zip -r vtt-windows-x64.zip vtt.exe SDL3.dll libwinpthread-1.dll assets/
             echo "Note: font.ttf not included (will use system fonts)"
           fi
           

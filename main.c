@@ -110,6 +110,9 @@ static struct {
     char dmg_buf[16];
     int dmg_len;
     
+    bool measure_active;
+    int measure_start_gx, measure_start_gy;
+    
     stbtt_fontinfo font;
     unsigned char *font_data;
     SDL_Texture *cond_tex[2][COND_COUNT];  // 2-letter abbreviations for tokens [view][cond]
@@ -561,6 +564,68 @@ static void render_view(int view) {
         SDL_RenderRect(r, &(SDL_FRect){x, y, w, h});
     }
     
+    // Measurement tool (DM view only)
+    if (view == 0 && g.measure_active) {
+        float mx, my;
+        SDL_GetMouseState(&mx, &my);
+        int end_gx, end_gy;
+        screen_to_grid(mx, my, c, &end_gx, &end_gy);
+        
+        // Calculate center points of grid cells
+        float start_wx = g.measure_start_gx * g.grid_size + g.grid_off_x + g.grid_size / 2.0f;
+        float start_wy = g.measure_start_gy * g.grid_size + g.grid_off_y + g.grid_size / 2.0f;
+        float end_wx = end_gx * g.grid_size + g.grid_off_x + g.grid_size / 2.0f;
+        float end_wy = end_gy * g.grid_size + g.grid_off_y + g.grid_size / 2.0f;
+        
+        // Convert to screen space
+        float start_sx = (start_wx - c->x) * c->zoom;
+        float start_sy = (start_wy - c->y) * c->zoom;
+        float end_sx = (end_wx - c->x) * c->zoom;
+        float end_sy = (end_wy - c->y) * c->zoom;
+        
+        // Draw line
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r, 255, 255, 0, 255);
+        SDL_RenderLine(r, start_sx, start_sy, end_sx, end_sy);
+        
+        // Draw endpoints
+        render_circle(r, start_sx, start_sy, 5, true, (SDL_Color){255, 255, 0, 200});
+        render_circle(r, end_sx, end_sy, 5, true, (SDL_Color){255, 255, 0, 200});
+        
+        // Calculate distance in grid cells (Chebyshev distance - diagonal = 1 cell)
+        int dx = abs(end_gx - g.measure_start_gx);
+        int dy = abs(end_gy - g.measure_start_gy);
+        int distance = (dx > dy) ? dx : dy;  // max(dx, dy)
+        
+        // Display distance text
+        if (g.font_data) {
+            char dist_buf[64];
+            snprintf(dist_buf, 64, "%d cells", distance);
+            
+            SDL_Color yellow = {255, 255, 0, 255};
+            int text_w, text_h;
+            SDL_Texture *dist_tex = bake_text_once(r, dist_buf, &text_w, &text_h, yellow, 20.0f);
+            
+            if (dist_tex) {
+                // Position text at midpoint of line, slightly above
+                float mid_sx = (start_sx + end_sx) / 2.0f;
+                float mid_sy = (start_sy + end_sy) / 2.0f - text_h - 10;
+                
+                // Background
+                SDL_SetRenderDrawColor(r, 0, 0, 0, 180);
+                SDL_RenderFillRect(r, &(SDL_FRect){mid_sx - text_w/2 - 5, mid_sy - 5, text_w + 10, text_h + 10});
+                
+                // Border
+                SDL_SetRenderDrawColor(r, 255, 255, 0, 255);
+                SDL_RenderRect(r, &(SDL_FRect){mid_sx - text_w/2 - 5, mid_sy - 5, text_w + 10, text_h + 10});
+                
+                // Text
+                SDL_RenderTexture(r, dist_tex, NULL, &(SDL_FRect){mid_sx - text_w/2, mid_sy, text_w, text_h});
+                SDL_DestroyTexture(dist_tex);
+            }
+        }
+    }
+    
     if (view == 0 && g.font_data) {
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
         
@@ -946,6 +1011,10 @@ static void handle_input() {
                 g.cond_wheel = false;
             }
             
+            if (k == SDLK_ESCAPE && g.measure_active) {
+                g.measure_active = false;
+            }
+            
             if (k >= SDLK_F1 && k <= SDLK_F12) {
                 int slot = k - SDLK_F1;
                 char path[64]; snprintf(path, 64, "saves/slot_%d.vtt", slot);
@@ -1122,7 +1191,22 @@ static void handle_input() {
             int gx, gy; 
             screen_to_grid(mx, my, &g.cam[0], &gx, &gy);
             
-            if (g.cal_active && e.button.button == 1) {
+            // Alt+Click to start measurement, Left Click to end measurement
+            SDL_Keymod mods = SDL_GetModState();
+            if (e.button.button == 1 && (mods & SDL_KMOD_ALT)) {
+                if (!g.measure_active) {
+                    // Start measurement
+                    g.measure_active = true;
+                    g.measure_start_gx = gx;
+                    g.measure_start_gy = gy;
+                } else {
+                    // End measurement (Alt+Click again)
+                    g.measure_active = false;
+                }
+            } else if (e.button.button == 1 && g.measure_active) {
+                // Left click (without Alt) ends measurement
+                g.measure_active = false;
+            } else if (g.cal_active && e.button.button == 1) {
                 g.cal_x1 = g.cal_x2 = (int)(mx/g.cam[0].zoom + g.cam[0].x);
                 g.cal_y1 = g.cal_y2 = (int)(my/g.cam[0].zoom + g.cam[0].y);
                 g.cal_drag = true;
@@ -1394,6 +1478,7 @@ int main(int argc, char **argv) {
     printf("  Left click - Select/move tokens, toggle fog, assign squad, or draw shapes\n");
     printf("  Right click - Pan camera (drag) / Delete drawing (middle-click in draw mode)\n");
     printf("  Mouse Wheel - Zoom in/out at cursor\n");
+    printf("  ALT+Click - Start/end measurement tool (shows distance in grid cells)\n");
     printf("  W - Cycle shape (in draw mode)\n");
     printf("  Q/E - Cycle colors (in squad/draw mode)\n");
     printf("  A - Open condition wheel for selected token\n");

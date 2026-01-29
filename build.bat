@@ -31,15 +31,20 @@ C:\msys64\mingw64\bin\gcc.exe -Wall -Wextra -O2 -std=c11 %EMBED% main.c stb_impl
 if %errorlevel% equ 0 (
     echo Build successful!
     echo.
-    echo Copying SDL3.dll for distribution...
+    echo Copying required DLLs for distribution...
     copy C:\msys64\mingw64\bin\SDL3.dll . >nul 2>&1
+    copy C:\msys64\mingw64\bin\libwinpthread-1.dll . >nul 2>&1
     if exist SDL3.dll (
         echo SDL3.dll copied
+    )
+    if exist libwinpthread-1.dll (
+        echo libwinpthread-1.dll copied
     )
     echo.
     echo Distribution package should include:
     echo   - vtt.exe
     echo   - SDL3.dll
+    echo   - libwinpthread-1.dll
     echo   - font.ttf ^(optional - will use system fonts if missing^)
     echo   - assets/ folder ^(for maps and tokens^)
     echo   - saves/ folder ^(for save files^)
