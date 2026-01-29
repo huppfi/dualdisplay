@@ -71,6 +71,8 @@ chmod +x build.sh
 ### Tools
 - 1 - Select tool
 - 2 - Fog of war tool
+  - Left click/drag - Paint or erase fog
+  - +/- - Adjust brush size (1x1 to 9x9 cells)
 - 3 - Squad assignment tool
 - 4 - Drawing tool
 
@@ -113,11 +115,19 @@ chmod +x build.sh
 - Right click + drag - Pan camera
 - Mouse wheel - Zoom in/out at cursor
 - P - Toggle player view sync
+- F10 - Zoom to fit entire map in player window
+- F11 - Toggle fullscreen (for focused window)
 
 ### Map/Grid
 - M - Next map
 - Shift+M - Previous map
 - C - Enter grid calibration mode
+  - Click and drag to select grid area
+  - Arrow keys - Move grid position (pixel by pixel)
+  - Shift + Arrow keys - Resize grid (pixel by pixel)
+  - +/- - Adjust number of cells
+  - Enter - Confirm calibration
+  - Esc - Cancel
 - G - Toggle grid overlay
 
 ### Save/Load

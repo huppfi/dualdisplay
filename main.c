@@ -100,8 +100,9 @@ static struct {
     bool drag_token, paint_fog, fog_mode, draw_shape, shift, ctrl;
     int drag_idx, paint_start_x, paint_start_y;
     float last_mx, last_my;
+    int fog_brush_size;
     
-    bool cal_active, cal_drag;
+    bool cal_active, cal_drag, cal_has_box;
     int cal_x1, cal_y1, cal_x2, cal_y2, cal_cells_w, cal_cells_h;
     
     bool cond_wheel;
@@ -119,8 +120,11 @@ static struct {
     SDL_Texture *cond_wheel_tex[COND_COUNT];  // Full names for wheel
     int cond_w, cond_h;
     
-    CachedText ui_tool, ui_squad, ui_dmg, ui_help;
+    CachedText ui_tool, ui_squad, ui_dmg, ui_help, ui_calibration;
+    CachedText ui_measure[2];  // Per-view measurement text
     Tool cached_tool;
+    bool cached_cal_drag;
+    int cached_measure_dist[2];
 } g;
 
 static bool is_image(const char *f) {
@@ -260,6 +264,16 @@ static inline void fog_set(int x, int y, bool v) {
     if (x >= 0 && x < g.fog_w && y >= 0 && y < g.fog_h) g.fog[y*g.fog_w+x] = v;
 }
 
+static void fog_paint_brush(int cx, int cy, bool v, int brush_size) {
+    // Paint in a square brush area
+    int radius = brush_size / 2;
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            fog_set(cx + dx, cy + dy, v);
+        }
+    }
+}
+
 static void cam_update(Camera *c) {
     c->x += (c->target_x - c->x) * 0.15f;
     c->y += (c->target_y - c->y) * 0.15f;
@@ -374,56 +388,77 @@ static void render_token_markers(SDL_Renderer *r, Token *t, const Camera *c, int
         }
     }
     
-    // Condition tags - bigger, inside token bounds, growing upward from bottom
-    float token_scale = t->size;
-    
+    // Condition tags - always show ALL active conditions, scaling to fit
     static const SDL_Color cond_colors[COND_COUNT] = {
         {220,20,20,255}, {255,215,0,255}, {147,51,234,255}, {255,140,0,255},
         {139,69,19,255}, {30,144,255,255}, {255,20,147,255}, {50,205,50,255}
     };
     
-    // Make tags bigger - CHANGE base_font_size TO ADJUST BOX SIZE (text scales independently below)
-    float padding = 3.0f * c->zoom;
-    float base_font_size = 32.0f;  // <-- CHANGE THIS VALUE to resize condition tag BOXES
-    float tag_width = base_font_size * 2.5f * c->zoom;
-    float tag_height = base_font_size * 1.4f * c->zoom;
-    
-    // Start from bottom of token, inside bounds, grow upward
-    float tag_x = sx + padding;
-    float tag_y = sy + sh - tag_height - padding * 2;
-    
+    // Count active conditions first
+    int active_count = 0;
     for (int i = 0; i < COND_COUNT; i++) {
-        if (!t->cond[i]) continue;
+        if (t->cond[i]) active_count++;
+    }
+    
+    if (active_count > 0) {
+        // Calculate how much vertical space we have
+        float available_height = sh - 4.0f * c->zoom; // Token height minus small margin
         
-        SDL_Color col = cond_colors[i];
+        // Base tag size
+        float base_font_size = 32.0f;
+        float padding = 3.0f * c->zoom;
+        float tag_width = base_font_size * 2.5f * c->zoom;
+        float tag_height = base_font_size * 1.4f * c->zoom;
+        float tag_spacing = padding * 3;
         
-        // Ensure tag stays inside token bounds
-        if (tag_y < sy + padding) break; // Stop if we run out of space
+        // Calculate total height needed for all tags
+        float total_height = active_count * (tag_height + padding * 2 + tag_spacing);
         
-        // Background with condition color
-        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-        SDL_FRect tag_bg = {tag_x, tag_y, tag_width + padding*2, tag_height + padding*2};
-        SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 230);
-        SDL_RenderFillRect(r, &tag_bg);
-        
-        // Border
-        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
-        SDL_RenderRect(r, &tag_bg);
-        
-        // Text - larger than box (text is baked at 16.0f)
-        if (g.cond_tex[view][i]) {
-            // CHANGE text_size_multiplier TO ADJUST TEXT SIZE (independent of box size)
-            float text_size_multiplier = 2.0f;  // <-- CHANGE THIS to make text bigger/smaller
-            float text_w = g.cond_w * c->zoom * text_size_multiplier;
-            float text_h = g.cond_h * c->zoom * text_size_multiplier;
-            SDL_FRect text_dst = {tag_x + padding + (tag_width - text_w) / 2, 
-                                  tag_y + padding + (tag_height - text_h) / 2, 
-                                  text_w, text_h};
-            SDL_RenderTexture(r, g.cond_tex[view][i], NULL, &text_dst);
+        // Scale down if needed to fit all tags - NO MINIMUM, always show all
+        float scale_factor = 1.0f;
+        if (total_height > available_height) {
+            scale_factor = available_height / total_height;
         }
         
-        // Move up for next tag
-        tag_y -= tag_height + padding * 3;
+        // Apply scaling
+        tag_width *= scale_factor;
+        tag_height *= scale_factor;
+        tag_spacing *= scale_factor;
+        padding *= scale_factor;
+        
+        // Start from bottom of token, inside bounds, grow upward
+        float tag_x = sx + padding * 2;
+        float tag_y = sy + sh - (tag_height + padding * 2) - padding * 2;
+        
+        for (int i = 0; i < COND_COUNT; i++) {
+            if (!t->cond[i]) continue;
+            
+            SDL_Color col = cond_colors[i];
+            
+            // Background with condition color
+            SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+            SDL_FRect tag_bg = {tag_x, tag_y, tag_width + padding*2, tag_height + padding*2};
+            SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 230);
+            SDL_RenderFillRect(r, &tag_bg);
+            
+            // Border
+            SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+            SDL_RenderRect(r, &tag_bg);
+            
+            // Text - scaled to match tag size
+            if (g.cond_tex[view][i]) {
+                float text_size_multiplier = 2.0f * scale_factor;
+                float text_w = g.cond_w * c->zoom * text_size_multiplier;
+                float text_h = g.cond_h * c->zoom * text_size_multiplier;
+                SDL_FRect text_dst = {tag_x + padding + (tag_width - text_w) / 2, 
+                                      tag_y + padding + (tag_height - text_h) / 2, 
+                                      text_w, text_h};
+                SDL_RenderTexture(r, g.cond_tex[view][i], NULL, &text_dst);
+            }
+            
+            // Move up for next tag
+            tag_y -= tag_height + padding * 2 + tag_spacing;
+        }
     }
 }
 
@@ -548,8 +583,8 @@ static void render_view(int view) {
         if (view == 1 && !fog_get(g.tokens[i].grid_x, g.tokens[i].grid_y)) continue;
         render_token_markers(r, &g.tokens[i], c, view);
     }
-    
-    if (view == 0 && g.cal_active && g.cal_drag) {
+    // Calibration grid overlay (show while active and after drawing)
+    if (view == 0 && g.cal_active && g.cal_has_box) {
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(r, 0, 100, 255, 80);
         float x = (fmin(g.cal_x1, g.cal_x2) - c->x)*c->zoom;
@@ -564,8 +599,8 @@ static void render_view(int view) {
         SDL_RenderRect(r, &(SDL_FRect){x, y, w, h});
     }
     
-    // Measurement tool (DM view only)
-    if (view == 0 && g.measure_active) {
+    // Measurement tool (visible on both views)
+    if (g.measure_active) {
         float mx, my;
         SDL_GetMouseState(&mx, &my);
         int end_gx, end_gy;
@@ -597,31 +632,61 @@ static void render_view(int view) {
         int dy = abs(end_gy - g.measure_start_gy);
         int distance = (dx > dy) ? dx : dy;  // max(dx, dy)
         
-        // Display distance text
+        // Display distance text (cached per-view to avoid creating/destroying textures every frame)
         if (g.font_data) {
-            char dist_buf[64];
-            snprintf(dist_buf, 64, "%d cells", distance);
+            if (g.cached_measure_dist[view] != distance) {
+                char dist_buf[64];
+                snprintf(dist_buf, 64, "%d cells", distance);
+                SDL_Color yellow = {255, 255, 0, 255};
+                update_cached_text(&g.ui_measure[view], r, dist_buf, yellow);
+                g.cached_measure_dist[view] = distance;
+            }
             
-            SDL_Color yellow = {255, 255, 0, 255};
-            int text_w, text_h;
-            SDL_Texture *dist_tex = bake_text_once(r, dist_buf, &text_w, &text_h, yellow, 20.0f);
-            
-            if (dist_tex) {
+            if (g.ui_measure[view].tex) {
                 // Position text at midpoint of line, slightly above
                 float mid_sx = (start_sx + end_sx) / 2.0f;
-                float mid_sy = (start_sy + end_sy) / 2.0f - text_h - 10;
+                float mid_sy = (start_sy + end_sy) / 2.0f - g.ui_measure[view].h - 10;
                 
                 // Background
                 SDL_SetRenderDrawColor(r, 0, 0, 0, 180);
-                SDL_RenderFillRect(r, &(SDL_FRect){mid_sx - text_w/2 - 5, mid_sy - 5, text_w + 10, text_h + 10});
+                SDL_RenderFillRect(r, &(SDL_FRect){mid_sx - g.ui_measure[view].w/2 - 5, mid_sy - 5, g.ui_measure[view].w + 10, g.ui_measure[view].h + 10});
                 
                 // Border
                 SDL_SetRenderDrawColor(r, 255, 255, 0, 255);
-                SDL_RenderRect(r, &(SDL_FRect){mid_sx - text_w/2 - 5, mid_sy - 5, text_w + 10, text_h + 10});
+                SDL_RenderRect(r, &(SDL_FRect){mid_sx - g.ui_measure[view].w/2 - 5, mid_sy - 5, g.ui_measure[view].w + 10, g.ui_measure[view].h + 10});
                 
                 // Text
-                SDL_RenderTexture(r, dist_tex, NULL, &(SDL_FRect){mid_sx - text_w/2, mid_sy, text_w, text_h});
-                SDL_DestroyTexture(dist_tex);
+                SDL_RenderTexture(r, g.ui_measure[view].tex, NULL, &(SDL_FRect){mid_sx - g.ui_measure[view].w/2, mid_sy, g.ui_measure[view].w, g.ui_measure[view].h});
+            }
+        }
+    }
+    
+    // Fog brush preview cursor (DM view only)
+    if (view == 0 && g.tool == TOOL_FOG && !g.paint_fog) {
+        float mx, my;
+        SDL_GetMouseState(&mx, &my);
+        int gx, gy;
+        screen_to_grid(mx, my, c, &gx, &gy);
+        
+        // Draw brush preview as colored grid squares
+        int radius = g.fog_brush_size / 2;
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        for (int dy = -radius; dy <= radius; dy++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                int cell_x = gx + dx;
+                int cell_y = gy + dy;
+                if (cell_x >= 0 && cell_x < g.fog_w && cell_y >= 0 && cell_y < g.fog_h) {
+                    float cx = (cell_x * g.grid_size + g.grid_off_x - c->x) * c->zoom;
+                    float cy = (cell_y * g.grid_size + g.grid_off_y - c->y) * c->zoom;
+                    float cw = g.grid_size * c->zoom;
+                    float ch = g.grid_size * c->zoom;
+                    
+                    // Yellow tint for preview
+                    SDL_SetRenderDrawColor(r, 255, 255, 0, 60);
+                    SDL_RenderFillRect(r, &(SDL_FRect){cx, cy, cw, ch});
+                    SDL_SetRenderDrawColor(r, 255, 255, 0, 150);
+                    SDL_RenderRect(r, &(SDL_FRect){cx, cy, cw, ch});
+                }
             }
         }
     }
@@ -634,7 +699,24 @@ static void render_view(int view) {
             g.cached_tool = g.tool;
             update_cached_text(&g.ui_tool, r, tool_names[g.tool], (SDL_Color){255,255,255,255});
         }
-        if (g.ui_tool.tex) {
+        // Show current tool or calibration mode
+        if (g.cal_active) {
+            // Calibration mode UI
+            const char *cal_text = g.cal_has_box ? 
+                "GRID CALIBRATION - Arrows: move | Shift+Arrows: resize | +/-: cells | ENTER: confirm" : 
+                "GRID CALIBRATION - Click and drag to select grid area";
+            if (g.cached_cal_drag != g.cal_has_box || !g.ui_calibration.tex) {
+                g.cached_cal_drag = g.cal_has_box;
+                update_cached_text(&g.ui_calibration, r, cal_text, (SDL_Color){255,255,100,255});
+            }
+            if (g.ui_calibration.tex) {
+                SDL_SetRenderDrawColor(r, 60, 40, 40, 240);
+                SDL_RenderFillRect(r, &(SDL_FRect){10, 10, g.ui_calibration.w + 40, g.ui_calibration.h + 20});
+                SDL_SetRenderDrawColor(r, 200, 150, 100, 255);
+                SDL_RenderRect(r, &(SDL_FRect){10, 10, g.ui_calibration.w + 40, g.ui_calibration.h + 20});
+                SDL_RenderTexture(r, g.ui_calibration.tex, NULL, &(SDL_FRect){20, 20, g.ui_calibration.w, g.ui_calibration.h});
+            }
+        } else if (g.ui_tool.tex) {
             SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
             SDL_RenderFillRect(r, &(SDL_FRect){10, 10, g.ui_tool.w + 40, g.ui_tool.h + 20});
             SDL_SetRenderDrawColor(r, 100, 100, 150, 255);
@@ -642,7 +724,60 @@ static void render_view(int view) {
             SDL_RenderTexture(r, g.ui_tool.tex, NULL, &(SDL_FRect){20, 20, g.ui_tool.w, g.ui_tool.h});
         }
         
-        if (g.tool == TOOL_SQUAD || g.tool == TOOL_DRAW) {
+        // Show tool-specific info below main tool display
+        if (g.tool == TOOL_SELECT) {
+            // Show selected token conditions
+            Token *selected_token = NULL;
+            for (int i = 0; i < g.token_count; i++) {
+                if (g.tokens[i].selected) {
+                    selected_token = &g.tokens[i];
+                    break;
+                }
+            }
+            
+            if (selected_token) {
+                // Build condition list string
+                const char *cond_names[] = {"Bleeding", "Dazed", "Frightened", "Grabbed", 
+                                           "Restrained", "Slowed", "Taunted", "Weakened"};
+                
+                // Build string with pointer tracking (O(n) instead of O(n²) with strcat)
+                char cond_buf[256];
+                char *p = cond_buf;
+                p += sprintf(p, "CONDITIONS: ");
+                bool has_any = false;
+                for (int i = 0; i < COND_COUNT; i++) {
+                    if (selected_token->cond[i]) {
+                        if (has_any) p += sprintf(p, ", ");
+                        p += sprintf(p, "%s", cond_names[i]);
+                        has_any = true;
+                    }
+                }
+                if (!has_any) sprintf(p, "None");
+                
+                update_cached_text(&g.ui_help, r, cond_buf, (SDL_Color){255,255,255,255});
+                if (g.ui_help.tex) {
+                    int y = 50;
+                    SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
+                    SDL_RenderFillRect(r, &(SDL_FRect){10, y, g.ui_help.w + 40, g.ui_help.h + 20});
+                    SDL_SetRenderDrawColor(r, 100, 100, 150, 255);
+                    SDL_RenderRect(r, &(SDL_FRect){10, y, g.ui_help.w + 40, g.ui_help.h + 20});
+                    SDL_RenderTexture(r, g.ui_help.tex, NULL, &(SDL_FRect){20, y+10, g.ui_help.w, g.ui_help.h});
+                }
+            }
+        } else if (g.tool == TOOL_FOG) {
+            // Show fog brush size
+            char buf[64];
+            snprintf(buf, 64, "FOG BRUSH: %dx%d cells (+/- to adjust)", g.fog_brush_size, g.fog_brush_size);
+            update_cached_text(&g.ui_squad, r, buf, (SDL_Color){255,255,255,255});
+            if (g.ui_squad.tex) {
+                int y = 50;
+                SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
+                SDL_RenderFillRect(r, &(SDL_FRect){10, y, g.ui_squad.w + 40, g.ui_squad.h + 20});
+                SDL_SetRenderDrawColor(r, 100, 100, 150, 255);
+                SDL_RenderRect(r, &(SDL_FRect){10, y, g.ui_squad.w + 40, g.ui_squad.h + 20});
+                SDL_RenderTexture(r, g.ui_squad.tex, NULL, &(SDL_FRect){20, y+10, g.ui_squad.w, g.ui_squad.h});
+            }
+        } else if (g.tool == TOOL_SQUAD || g.tool == TOOL_DRAW) {
             char buf[64];
             const char *type = g.tool == TOOL_SQUAD ? "SQUAD" : "DRAW";
             snprintf(buf, 64, "%s: Color %d", type, g.current_squad);
@@ -887,6 +1022,14 @@ static void handle_input() {
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) exit(0);
         
+        // Close app if either window's X button is clicked
+        if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+            SDL_WindowID closed_window = e.window.windowID;
+            if (closed_window == g.dm.id || closed_window == g.player.id) {
+                exit(0);
+            }
+        }
+        
         if (e.type == SDL_EVENT_KEY_DOWN) {
             g.shift = (e.key.mod & SDL_KMOD_SHIFT) != 0;
             g.ctrl = (e.key.mod & SDL_KMOD_CTRL) != 0;
@@ -918,7 +1061,9 @@ static void handle_input() {
             }
             
             if (k == SDLK_C && !g.cal_active) {
-                g.cal_active = true; g.cal_drag = false;
+                g.cal_active = true;
+                g.cal_drag = false;
+                g.cal_has_box = false;
                 g.cal_cells_w = g.cal_cells_h = 2;
             }
             
@@ -932,13 +1077,37 @@ static void handle_input() {
                         fog_init((g.map_w + g.grid_size)/g.grid_size, (g.map_h + g.grid_size)/g.grid_size);
                     }
                     g.cal_active = false;
+                    g.cal_has_box = false;
                 }
-                if (k == SDLK_ESCAPE) g.cal_active = false;
-                if (g.cal_drag) {
-                    if (k == SDLK_UP) g.cal_cells_h++;
-                    if (k == SDLK_DOWN && g.cal_cells_h > 1) g.cal_cells_h--;
-                    if (k == SDLK_RIGHT) g.cal_cells_w++;
-                    if (k == SDLK_LEFT && g.cal_cells_w > 1) g.cal_cells_w--;
+                if (k == SDLK_ESCAPE) {
+                    g.cal_active = false;
+                    g.cal_has_box = false;
+                }
+                if (g.cal_has_box) {
+                    // +/- to adjust cell count (or = for +)
+                    if (k == SDLK_EQUALS || k == SDLK_KP_PLUS) {
+                        g.cal_cells_w++;
+                        g.cal_cells_h++;
+                    }
+                    if ((k == SDLK_MINUS || k == SDLK_KP_MINUS) && g.cal_cells_w > 1 && g.cal_cells_h > 1) {
+                        g.cal_cells_w--;
+                        g.cal_cells_h--;
+                    }
+                    
+                    // Arrow keys to adjust grid position/size pixel by pixel
+                    if (g.shift) {
+                        // Shift + Arrows: Resize the grid (move second point)
+                        if (k == SDLK_UP) g.cal_y2--;
+                        if (k == SDLK_DOWN) g.cal_y2++;
+                        if (k == SDLK_LEFT) g.cal_x2--;
+                        if (k == SDLK_RIGHT) g.cal_x2++;
+                    } else {
+                        // Arrows alone: Move the entire grid
+                        if (k == SDLK_UP) { g.cal_y1--; g.cal_y2--; }
+                        if (k == SDLK_DOWN) { g.cal_y1++; g.cal_y2++; }
+                        if (k == SDLK_LEFT) { g.cal_x1--; g.cal_x2--; }
+                        if (k == SDLK_RIGHT) { g.cal_x1++; g.cal_x2++; }
+                    }
                 }
                 continue;
             }
@@ -1014,8 +1183,8 @@ static void handle_input() {
             if (k == SDLK_ESCAPE && g.measure_active) {
                 g.measure_active = false;
             }
-            
-            if (k >= SDLK_F1 && k <= SDLK_F12) {
+
+            if (k >= SDLK_F1 && k <= SDLK_F9) {
                 int slot = k - SDLK_F1;
                 char path[64]; snprintf(path, 64, "saves/slot_%d.vtt", slot);
                 uint32_t magic = SAVE_MAGIC;
@@ -1142,17 +1311,83 @@ static void handle_input() {
             if (k == SDLK_P) g.sync_views = !g.sync_views;
             if (k == SDLK_G) g.show_grid = !g.show_grid;
             
+            if (k == SDLK_F10) {
+                // Zoom to fit map perfectly in player window
+                if (g.map_current < g.map_count) {
+                    Window *win = &g.player;
+                    Camera *cam = &g.cam[0];
+                    
+                    // Calculate aspect ratios
+                    float map_aspect = (float)g.map_w / g.map_h;
+                    float win_aspect = (float)win->w / win->h;
+                    
+                    // Fit to width or height (whichever is limiting)
+                    float fit_zoom;
+                    if (map_aspect > win_aspect) {
+                        // Map is wider - fit to width
+                        fit_zoom = (float)win->w / g.map_w;
+                    } else {
+                        // Map is taller - fit to height
+                        fit_zoom = (float)win->h / g.map_h;
+                    }
+                    
+                    // Center camera on map
+                    cam->target_zoom = fit_zoom;
+                    cam->target_x = g.map_w / 2.0f - win->w / (2.0f * fit_zoom);
+                    cam->target_y = g.map_h / 2.0f - win->h / (2.0f * fit_zoom);
+                }
+            }
+            
+            if (k == SDLK_F11) {
+                // Toggle fullscreen for the window that triggered this event
+                SDL_WindowID event_window = e.key.windowID;
+                Window *target_win = NULL;
+                
+                if (event_window == g.dm.id) {
+                    target_win = &g.dm;
+                } else if (event_window == g.player.id) {
+                    target_win = &g.player;
+                }
+                
+                if (target_win) {
+                    SDL_WindowFlags flags = SDL_GetWindowFlags(target_win->win);
+                    if (flags & SDL_WINDOW_FULLSCREEN) {
+                        // Exit fullscreen
+                        SDL_SetWindowFullscreen(target_win->win, false);
+                    } else {
+                        // Enter fullscreen
+                        SDL_SetWindowFullscreen(target_win->win, true);
+                    }
+                }
+            }
+
+            if (k == SDLK_F11) {
+            }
+
+            
             if (k == SDLK_X && g.tool == TOOL_DRAW) {
                 g.drawing_count = 0;
             }
             
             if ((k == SDLK_EQUALS || k == SDLK_KP_PLUS)) {
-                for (int i = 0; i < g.token_count; i++) 
-                    if (g.tokens[i].selected && g.tokens[i].size < 4) g.tokens[i].size++;
+                if (g.tool == TOOL_FOG) {
+                    // Increase fog brush size
+                    if (g.fog_brush_size < 9) g.fog_brush_size += 2; // Keep it odd for symmetry
+                } else {
+                    // Resize selected tokens
+                    for (int i = 0; i < g.token_count; i++) 
+                        if (g.tokens[i].selected && g.tokens[i].size < 4) g.tokens[i].size++;
+                }
             }
             if ((k == SDLK_MINUS || k == SDLK_KP_MINUS)) {
-                for (int i = 0; i < g.token_count; i++) 
-                    if (g.tokens[i].selected && g.tokens[i].size > 1) g.tokens[i].size--;
+                if (g.tool == TOOL_FOG) {
+                    // Decrease fog brush size
+                    if (g.fog_brush_size > 1) g.fog_brush_size -= 2; // Keep it odd
+                } else {
+                    // Resize selected tokens
+                    for (int i = 0; i < g.token_count; i++) 
+                        if (g.tokens[i].selected && g.tokens[i].size > 1) g.tokens[i].size--;
+                }
             }
             
             if (!g.dmg_input && k >= SDLK_1 && k <= SDLK_9) {
@@ -1210,6 +1445,7 @@ static void handle_input() {
                 g.cal_x1 = g.cal_x2 = (int)(mx/g.cam[0].zoom + g.cam[0].x);
                 g.cal_y1 = g.cal_y2 = (int)(my/g.cam[0].zoom + g.cam[0].y);
                 g.cal_drag = true;
+                g.cal_has_box = true;
             } else if (e.button.button == 1) {
                 if (g.cond_wheel) {
                     float cx = g.dm.w/2.0f, cy = g.dm.h/2.0f;
@@ -1261,7 +1497,7 @@ static void handle_input() {
                 } else if (g.tool == TOOL_FOG) {
                     g.paint_fog = true;
                     g.fog_mode = fog_get(gx, gy);
-                    fog_set(gx, gy, !g.fog_mode);
+                    fog_paint_brush(gx, gy, !g.fog_mode, g.fog_brush_size);
                 } else if (g.tool == TOOL_SQUAD) {
                     for (int i = 0; i < g.token_count; i++) {
                         if (g.tokens[i].grid_x == gx && g.tokens[i].grid_y == gy) {
@@ -1335,7 +1571,7 @@ static void handle_input() {
             } else if (g.paint_fog) {
                 int gx, gy; 
                 screen_to_grid(mx, my, &g.cam[0], &gx, &gy);
-                fog_set(gx, gy, !g.fog_mode);
+                fog_paint_brush(gx, gy, !g.fog_mode, g.fog_brush_size);
             } else if (e.motion.state & SDL_BUTTON_MASK(3)) {
                 g.cam[0].target_x -= (mx - g.last_mx)/g.cam[0].zoom;
                 g.cam[0].target_y -= (my - g.last_my)/g.cam[0].zoom;
@@ -1472,10 +1708,14 @@ int main(int argc, char **argv) {
     g.show_grid = true;
     g.sync_views = true;
     g.cached_tool = TOOL_FOG;
+    g.cached_cal_drag = false;
+    g.cached_measure_dist[0] = g.cached_measure_dist[1] = -1;
+    g.fog_brush_size = 1;
     
     printf("VTT started. Controls:\n");
     printf("  1 - Select tool, 2 - Fog tool, 3 - Squad assignment tool, 4 - Draw tool\n");
     printf("  Left click - Select/move tokens, toggle fog, assign squad, or draw shapes\n");
+    printf("  +/- - Fog tool: adjust brush size | Select tool: resize token\n");
     printf("  Right click - Pan camera (drag) / Delete drawing (middle-click in draw mode)\n");
     printf("  Mouse Wheel - Zoom in/out at cursor\n");
     printf("  ALT+Click - Start/end measurement tool (shows distance in grid cells)\n");
@@ -1487,8 +1727,11 @@ int main(int argc, char **argv) {
     printf("  X - Clear all drawings (in draw mode)\n");
     printf("  P - Toggle player view sync to DM view\n");
     printf("  G - Toggle grid overlay\n");
+    printf("  F10 - Zoom to fit map in player window\n");
+    printf("  F11 - Toggle fullscreen (for focused window)\n");
     printf("  M - Cycle to next map, SHIFT+M - Previous map\n");
     printf("  C - Enter grid calibration mode\n");
+    printf("      Arrow keys - Move grid | Shift+Arrows - Resize grid | +/- - Adjust cells | Enter - Confirm\n");
     printf("  H - Toggle selected token hidden/visible\n");
     printf("  +/- - Resize selected token\n");
     printf("  1-9 - Add damage to selected token\n");
@@ -1501,6 +1744,7 @@ int main(int argc, char **argv) {
     printf("  SHIFT+F1-F12 - Save to slot\n");
     printf("  F1-F12 - Load from slot\n");
     printf("  ESC - Deselect all / Cancel damage input / Close condition wheel\n");
+    printf("  X button (on either window) - Close application\n");
     
     while (1) {
         handle_input();

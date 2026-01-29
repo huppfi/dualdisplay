@@ -26,6 +26,7 @@ nul
 
 # Save files
 saves/
+assets/
 .claude/
 
 # IDE/Editor files
