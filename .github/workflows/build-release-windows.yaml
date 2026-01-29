@@ -41,12 +41,12 @@ jobs:
           echo "Compiling STB libraries..."
           gcc -c -O2 -std=c11 stb_impl.c -o stb_impl.o
 
-          # Step 2: Compile main.c and link with STB
+          # Step 2: Compile main.c and link with STB (static linking for portability)
           echo "Compiling main.c..."
           gcc -Wall -Wextra -O2 -std=c11 main.c stb_impl.o -o vtt.exe \
             -I/mingw64/include/SDL3 \
             -L/mingw64/lib \
-            -lSDL3 -lm
+            -lSDL3 -lm -static-libgcc -static-libstdc++
 
       - name: Bundle SDL3.dll, font, and prepare release structure
         run: |

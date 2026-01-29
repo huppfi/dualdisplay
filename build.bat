@@ -24,9 +24,9 @@ if not exist stb_impl.o (
     )
 )
 
-REM Compile main.c and link with STB
+REM Compile main.c and link with STB (static linking for portability)
 echo Compiling main.c...
-C:\msys64\mingw64\bin\gcc.exe -Wall -Wextra -O2 -std=c11 %EMBED% main.c stb_impl.o -o vtt.exe -IC:/msys64/mingw64/include/SDL3 -LC:/msys64/mingw64/lib -lSDL3 -lm
+C:\msys64\mingw64\bin\gcc.exe -Wall -Wextra -O2 -std=c11 %EMBED% main.c stb_impl.o -o vtt.exe -IC:/msys64/mingw64/include/SDL3 -LC:/msys64/mingw64/lib -lSDL3 -lm -static-libgcc -static-libstdc++
 
 if %errorlevel% equ 0 (
     echo Build successful!
