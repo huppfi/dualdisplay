@@ -30,6 +30,99 @@ extern unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, int str
 #define MAX_DRAWINGS 256
 #define SAVE_MAGIC 0x56545402  // Version 2 with embedded assets
 
+// Profiling system (set to 0 to disable)
+#define PROFILER_ENABLED 1
+#define MAX_PROFILE_ENTRIES 32
+
+typedef struct {
+    const char *name;
+    uint64_t elapsed;
+    uint32_t hit_count;
+} ProfileEntry;
+
+static struct {
+    ProfileEntry entries[MAX_PROFILE_ENTRIES];
+    int count;
+    uint64_t freq;
+    uint64_t frame_start;
+    bool show_overlay;
+} profiler;
+
+#if PROFILER_ENABLED
+#define PROFILE_BEGIN(name) uint64_t _prof_start_##name = SDL_GetPerformanceCounter()
+#define PROFILE_END(name) profile_record(#name, _prof_start_##name, SDL_GetPerformanceCounter())
+#else
+#define PROFILE_BEGIN(name)
+#define PROFILE_END(name)
+#endif
+
+static void profile_record(const char *name, uint64_t start, uint64_t end) {
+    uint64_t elapsed = end - start;
+    
+    // Find or create entry
+    ProfileEntry *entry = NULL;
+    for (int i = 0; i < profiler.count; i++) {
+        if (strcmp(profiler.entries[i].name, name) == 0) {
+            entry = &profiler.entries[i];
+            break;
+        }
+    }
+    
+    if (!entry && profiler.count < MAX_PROFILE_ENTRIES) {
+        entry = &profiler.entries[profiler.count++];
+        entry->name = name;
+        entry->elapsed = 0;
+        entry->hit_count = 0;
+    }
+    
+    if (entry) {
+        entry->elapsed += elapsed;
+        entry->hit_count++;
+    }
+}
+
+static void profile_frame_begin() {
+    profiler.frame_start = SDL_GetPerformanceCounter();
+    // Reset counters
+    for (int i = 0; i < profiler.count; i++) {
+        profiler.entries[i].elapsed = 0;
+        profiler.entries[i].hit_count = 0;
+    }
+}
+
+static void profile_frame_end() {
+    uint64_t frame_end = SDL_GetPerformanceCounter();
+    uint64_t frame_time = frame_end - profiler.frame_start;
+    
+    if (!profiler.show_overlay) return;
+    
+    // Print to console every 60 frames
+    static int frame_counter = 0;
+    if (++frame_counter >= 60) {
+        frame_counter = 0;
+        
+        float frame_ms = (frame_time * 1000.0f) / profiler.freq;
+        float budget_ms = 16.67f; // 60 FPS target
+        
+        printf("\n=== PROFILER (Frame: %.2f ms / %.2f ms budget) ===\n", frame_ms, budget_ms);
+        printf("%-30s %10s %8s %8s %6s\n", "Function", "Time(ms)", "Calls", "Avg(us)", "%");
+        printf("----------------------------------------------------------------\n");
+        
+        for (int i = 0; i < profiler.count; i++) {
+            ProfileEntry *e = &profiler.entries[i];
+            if (e->hit_count == 0) continue;
+            
+            float ms = (e->elapsed * 1000.0f) / profiler.freq;
+            float avg_us = (e->elapsed * 1000000.0f) / profiler.freq / e->hit_count;
+            float pct = (e->elapsed * 100.0f) / frame_time;
+            
+            printf("%-30s %10.3f %8d %8.1f %5.1f%%\n", 
+                   e->name, ms, e->hit_count, avg_us, pct);
+        }
+        printf("================================================================\n\n");
+    }
+}
+
 typedef enum { TOOL_SELECT, TOOL_FOG, TOOL_SQUAD, TOOL_DRAW } Tool;
 typedef enum { SHAPE_RECT, SHAPE_CIRCLE } Shape;
 typedef enum {
@@ -300,20 +393,44 @@ static void screen_to_grid(float sx, float sy, const Camera *c, int *gx, int *gy
 static void render_circle(SDL_Renderer *r, float cx, float cy, float rad, bool fill, SDL_Color col) {
     SDL_SetRenderDrawColor(r, col.r, col.g, col.b, col.a);
     if (fill) {
+        // Batch all horizontal lines into a single array
+        static SDL_FRect rects[2048];
+        int rect_count = 0;
         int ir = (int)rad;
-        for (int y = -ir; y <= ir; y++) {
-            int hw = (int)sqrtf(rad*rad - y*y);
-            if (hw > 0) SDL_RenderFillRect(r, &(SDL_FRect){cx-hw, cy+y, hw*2, 1});
+        float rad_sq = rad * rad;
+        
+        for (int y = -ir; y <= ir && rect_count < 2048; y++) {
+            float y_sq = y * y;
+            int hw = (int)sqrtf(rad_sq - y_sq);
+            if (hw > 0) {
+                rects[rect_count++] = (SDL_FRect){cx - hw, cy + y, hw * 2, 1};
+            }
+        }
+        
+        if (rect_count > 0) {
+            SDL_RenderFillRects(r, rects, rect_count);
         }
     } else {
+        // Batch all outline points into a single array
+        static SDL_FPoint points[2048];
+        int point_count = 0;
         int x = 0, y = (int)rad, d = 3 - 2*(int)rad;
-        while (y >= x) {
-            SDL_RenderPoint(r, cx+x, cy+y); SDL_RenderPoint(r, cx-x, cy+y);
-            SDL_RenderPoint(r, cx+x, cy-y); SDL_RenderPoint(r, cx-x, cy-y);
-            SDL_RenderPoint(r, cx+y, cy+x); SDL_RenderPoint(r, cx-y, cy+x);
-            SDL_RenderPoint(r, cx+y, cy-x); SDL_RenderPoint(r, cx-y, cy-x);
+        
+        while (y >= x && point_count < 2040) {
+            points[point_count++] = (SDL_FPoint){cx+x, cy+y};
+            points[point_count++] = (SDL_FPoint){cx-x, cy+y};
+            points[point_count++] = (SDL_FPoint){cx+x, cy-y};
+            points[point_count++] = (SDL_FPoint){cx-x, cy-y};
+            points[point_count++] = (SDL_FPoint){cx+y, cy+x};
+            points[point_count++] = (SDL_FPoint){cx-y, cy+x};
+            points[point_count++] = (SDL_FPoint){cx+y, cy-x};
+            points[point_count++] = (SDL_FPoint){cx-y, cy-x};
             x++; d += (d > 0) ? 4*(x-y)+10 : 4*x+6;
             if (d > 0) y--;
+        }
+        
+        if (point_count > 0) {
+            SDL_RenderPoints(r, points, point_count);
         }
     }
 }
@@ -468,9 +585,12 @@ static void render_view(int view) {
     Camera *c = &g.cam[view];
     SDL_GetWindowSize(win->win, &win->w, &win->h);
     
+    PROFILE_BEGIN(clear_screen);
     SDL_SetRenderDrawColor(r, 20, 20, 20, 255);
     SDL_RenderClear(r);
+    PROFILE_END(clear_screen);
     
+    PROFILE_BEGIN(map_render);
     if (g.map_current < g.map_count) {
         Asset *m = &g.map_assets[g.map_current];
         ensure_asset_loaded(m);
@@ -478,8 +598,10 @@ static void render_view(int view) {
             SDL_RenderTexture(r, m->tex[view], NULL, &(SDL_FRect){-c->x*c->zoom, -c->y*c->zoom, m->w*c->zoom, m->h*c->zoom});
         }
     }
+    PROFILE_END(map_render);
     
     // Z-Layer: Grid (optional overlay)
+    PROFILE_BEGIN(grid_render);
     if (view == 0 && g.show_grid) {
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(r, 100, 100, 100, 100);
@@ -496,8 +618,10 @@ static void render_view(int view) {
             SDL_RenderLine(r, 0, py, win->w, py);
         }
     }
+    PROFILE_END(grid_render);
     
     // Z-Layer: Drawings (below tokens)
+    PROFILE_BEGIN(drawings_render);
     static const SDL_Color cols[8] = {
         {255,50,50,128},{50,150,255,128},{50,255,50,128},{255,255,50,128},
         {255,150,50,128},{200,50,255,128},{50,255,255,128},{255,255,255,128}
@@ -522,12 +646,15 @@ static void render_view(int view) {
             render_circle(r, (x1+x2)/2, (y1+y2)/2, rad, false, b);
         }
     }
+    PROFILE_END(drawings_render);
     
     // Z-Layer: Tokens (without damage/conditions)
+    PROFILE_BEGIN(tokens_render);
     for (int i = 0; i < g.token_count; i++) {
         if (view == 1 && !fog_get(g.tokens[i].grid_x, g.tokens[i].grid_y)) continue;
         render_token(r, &g.tokens[i], c, view);
     }
+    PROFILE_END(tokens_render);
     
     if (view == 0 && g.draw_shape) {
         float mx, my;
@@ -555,6 +682,7 @@ static void render_view(int view) {
     }
     
     // Z-Layer: Fog of War
+    PROFILE_BEGIN(fog_render);
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(r, 0, 0, 0, view == 0 ? 180 : 255);
     int sc = (c->x - g.grid_off_x) / g.grid_size;
@@ -577,13 +705,18 @@ static void render_view(int view) {
             }
         }
     }
+    PROFILE_END(fog_render);
     
     // Z-Layer: Damage and Condition Markers (topmost layer for tokens)
+    PROFILE_BEGIN(token_markers_render);
     for (int i = 0; i < g.token_count; i++) {
         if (view == 1 && !fog_get(g.tokens[i].grid_x, g.tokens[i].grid_y)) continue;
         render_token_markers(r, &g.tokens[i], c, view);
     }
+    PROFILE_END(token_markers_render);
+    
     // Calibration grid overlay (show while active and after drawing)
+    PROFILE_BEGIN(calibration_render);
     if (view == 0 && g.cal_active && g.cal_has_box) {
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(r, 0, 100, 255, 80);
@@ -598,8 +731,10 @@ static void render_view(int view) {
         for (int i = 1; i < g.cal_cells_h; i++) SDL_RenderLine(r, x, y+i*ch, x+w, y+i*ch);
         SDL_RenderRect(r, &(SDL_FRect){x, y, w, h});
     }
+    PROFILE_END(calibration_render);
     
     // Measurement tool (visible on both views)
+    PROFILE_BEGIN(measurement_render);
     if (g.measure_active) {
         float mx, my;
         SDL_GetMouseState(&mx, &my);
@@ -660,8 +795,10 @@ static void render_view(int view) {
             }
         }
     }
+    PROFILE_END(measurement_render);
     
     // Fog brush preview cursor (DM view only)
+    PROFILE_BEGIN(fog_brush_preview);
     if (view == 0 && g.tool == TOOL_FOG && !g.paint_fog) {
         float mx, my;
         SDL_GetMouseState(&mx, &my);
@@ -690,7 +827,9 @@ static void render_view(int view) {
             }
         }
     }
+    PROFILE_END(fog_brush_preview);
     
+    PROFILE_BEGIN(ui_render);
     if (view == 0 && g.font_data) {
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
         
@@ -913,8 +1052,11 @@ static void render_view(int view) {
             }
         }
     }
+    PROFILE_END(ui_render);
     
+    PROFILE_BEGIN(present);
     SDL_RenderPresent(r);
+    PROFILE_END(present);
 }
 
 // Helper for saving embedded PNG data
@@ -1360,8 +1502,11 @@ static void handle_input() {
                     }
                 }
             }
-
-            if (k == SDLK_F11) {
+            
+            if (k == SDLK_F12) {
+                // Toggle profiler overlay
+                profiler.show_overlay = !profiler.show_overlay;
+                printf("\n[Profiler %s]\n", profiler.show_overlay ? "ENABLED" : "DISABLED");
             }
 
             
@@ -1609,6 +1754,11 @@ int main(int argc, char **argv) {
     
     SDL_Init(SDL_INIT_VIDEO);
     
+    // Initialize profiler
+    profiler.freq = SDL_GetPerformanceFrequency();
+    profiler.count = 0;
+    profiler.show_overlay = false;
+    
     g.dm.win = SDL_CreateWindow("DM View", 1280, 720, SDL_WINDOW_RESIZABLE);
     g.player.win = SDL_CreateWindow("Player View", 1280, 720, SDL_WINDOW_RESIZABLE);
     g.dm.ren = SDL_CreateRenderer(g.dm.win, NULL);
@@ -1729,6 +1879,7 @@ int main(int argc, char **argv) {
     printf("  G - Toggle grid overlay\n");
     printf("  F10 - Zoom to fit map in player window\n");
     printf("  F11 - Toggle fullscreen (for focused window)\n");
+    printf("  F12 - Toggle performance profiler (prints to console)\n");
     printf("  M - Cycle to next map, SHIFT+M - Previous map\n");
     printf("  C - Enter grid calibration mode\n");
     printf("      Arrow keys - Move grid | Shift+Arrows - Resize grid | +/- - Adjust cells | Enter - Confirm\n");
@@ -1747,8 +1898,13 @@ int main(int argc, char **argv) {
     printf("  X button (on either window) - Close application\n");
     
     while (1) {
-        handle_input();
+        profile_frame_begin();
         
+        PROFILE_BEGIN(handle_input);
+        handle_input();
+        PROFILE_END(handle_input);
+        
+        PROFILE_BEGIN(cam_update);
         cam_update(&g.cam[0]);
         if (g.sync_views) {
             g.cam[1].target_x = g.cam[0].target_x;
@@ -1756,9 +1912,17 @@ int main(int argc, char **argv) {
             g.cam[1].target_zoom = g.cam[0].target_zoom;
         }
         cam_update(&g.cam[1]);
+        PROFILE_END(cam_update);
         
+        PROFILE_BEGIN(render_dm);
         render_view(0);
+        PROFILE_END(render_dm);
+        
+        PROFILE_BEGIN(render_player);
         render_view(1);
+        PROFILE_END(render_player);
+        
+        profile_frame_end();
         
         SDL_Delay(16);
     }
