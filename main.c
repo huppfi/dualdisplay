@@ -124,6 +124,7 @@ static void profile_frame_end() {
 }
 
 typedef enum { TOOL_SELECT, TOOL_FOG, TOOL_SQUAD, TOOL_DRAW } Tool;
+typedef enum { RANK_NONE, RANK_MINION, RANK_CAPTAIN, RANK_COUNT } TokenRank;
 typedef enum { SHAPE_RECT, SHAPE_CIRCLE } Shape;
 typedef enum {
     COND_BLEED, COND_DAZED, COND_FRIGHT, COND_GRABBED,
@@ -150,6 +151,8 @@ typedef struct {
     bool hidden, selected, cond[COND_COUNT];
     SDL_Texture *damage_tex[2];
     int cached_dmg[2];
+    int rank;  // 0=none, 1=minion, 2=captain
+    int aura;  // 0=no aura, >0 = aura radius in cells (1 = 3x3, 2 = 5x5, etc.)
 } Token;
 
 typedef struct {
@@ -218,6 +221,21 @@ static struct {
     Tool cached_tool;
     bool cached_cal_drag;
     int cached_measure_dist[2];
+    
+    // Touch input state - track by finger ID for proper multi-touch handling
+    #define MAX_TOUCH_FINGERS 4
+    struct TouchFinger {
+        SDL_FingerID id;
+        float x, y;
+        float start_x, start_y;
+    } touch_fingers[MAX_TOUCH_FINGERS];
+    int touch_count;
+    bool touch_ignore_mode;  // Set when 3+ fingers touch, cleared when all released
+    int touch_gesture;  // 0=NONE, 1=PAN, 2=PINCH (locked gesture type once detected)
+    float touch_start_dist;  // Initial distance for pinch detection
+    float touch_start_zoom;  // Camera zoom at gesture start
+    float touch_start_center_x, touch_start_center_y;  // For pan calculation
+    float touch_start_cam_x, touch_start_cam_y;  // Camera position at gesture start
 } g;
 
 static bool is_image(const char *f) {
@@ -290,28 +308,20 @@ static void update_cached_text(CachedText *c, SDL_Renderer *r, const char *s, SD
     c->tex = bake_text_once(r, s, &c->w, &c->h, col, 20.0f);
 }
 
-static int load_asset_to_both(const char *path, Asset *slot) {
-    int w, h;
-    unsigned char *data = stbi_load(path, &w, &h, NULL, 4);
-    if (!data) return -1;
-    strncpy(slot->path, path, 255);
-    slot->path[255] = '\0';
-    slot->w = w; slot->h = h;
-    SDL_Surface *s = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_RGBA32, data, w*4);
-    if (s) {
-        slot->tex[0] = SDL_CreateTextureFromSurface(g.dm.ren, s);
-        slot->tex[1] = SDL_CreateTextureFromSurface(g.player.ren, s);
-        SDL_DestroySurface(s);
+static void draw_ui_panel(SDL_Renderer *r, float x, float y, float w, float h, 
+                          SDL_Color bg, SDL_Color border, SDL_Texture *tex, float pad_x, float pad_y) {
+    SDL_SetRenderDrawColor(r, bg.r, bg.g, bg.b, bg.a);
+    SDL_RenderFillRect(r, &(SDL_FRect){x, y, w, h});
+    SDL_SetRenderDrawColor(r, border.r, border.g, border.b, border.a);
+    SDL_RenderRect(r, &(SDL_FRect){x, y, w, h});
+    if (tex) {
+        float tex_w, tex_h;
+        SDL_GetTextureSize(tex, &tex_w, &tex_h);
+        SDL_RenderTexture(r, tex, NULL, &(SDL_FRect){x + pad_x, y + pad_y, tex_w, tex_h});
     }
-    stbi_image_free(data);
-    slot->loaded = (slot->tex[0] && slot->tex[1]);
-    return slot->loaded ? 0 : -1;
 }
 
-static int load_asset_from_memory(unsigned char *data, int data_len, Asset *slot, const char *name) {
-    int w, h;
-    unsigned char *pixels = stbi_load_from_memory(data, data_len, &w, &h, NULL, 4);
-    if (!pixels) return -1;
+static int load_asset_from_pixels(unsigned char *pixels, int w, int h, Asset *slot, const char *name) {
     strncpy(slot->path, name, 255);
     slot->path[255] = '\0';
     slot->w = w; slot->h = h;
@@ -321,9 +331,26 @@ static int load_asset_from_memory(unsigned char *data, int data_len, Asset *slot
         slot->tex[1] = SDL_CreateTextureFromSurface(g.player.ren, s);
         SDL_DestroySurface(s);
     }
-    stbi_image_free(pixels);
     slot->loaded = (slot->tex[0] && slot->tex[1]);
     return slot->loaded ? 0 : -1;
+}
+
+static int load_asset_to_both(const char *path, Asset *slot) {
+    int w, h;
+    unsigned char *pixels = stbi_load(path, &w, &h, NULL, 4);
+    if (!pixels) return -1;
+    int result = load_asset_from_pixels(pixels, w, h, slot, path);
+    stbi_image_free(pixels);
+    return result;
+}
+
+static int load_asset_from_memory(unsigned char *data, int data_len, Asset *slot, const char *name) {
+    int w, h;
+    unsigned char *pixels = stbi_load_from_memory(data, data_len, &w, &h, NULL, 4);
+    if (!pixels) return -1;
+    int result = load_asset_from_pixels(pixels, w, h, slot, name);
+    stbi_image_free(pixels);
+    return result;
 }
 
 static void ensure_asset_loaded(Asset *slot) {
@@ -472,6 +499,40 @@ static void render_token(SDL_Renderer *r, Token *t, const Camera *c, int view) {
         SDL_SetRenderDrawColor(r, 255, 255, 0, 255);
         SDL_RenderRect(r, &(SDL_FRect){sx, sy, sw, sh});
     }
+    
+    // Draw rank letter (M or C) for minions and captains
+    if (t->rank != RANK_NONE && g.font_data) {
+        const char *letter = (t->rank == RANK_MINION) ? "M" : "C";
+        int w, h;
+        SDL_Texture *tex = bake_text_once(r, letter, &w, &h, (SDL_Color){0,0,0,255}, 96.0f * c->zoom);
+        if (tex) {
+            float lw = w, lh = h;
+            SDL_RenderTexture(r, tex, NULL, &(SDL_FRect){sx + sw/2 - lw/2, sy + sh/2 - lh/2, lw, lh});
+            SDL_DestroyTexture(tex);  // Not cached, create/destroy each frame
+        }
+    }
+    
+}
+
+static void render_token_aura(SDL_Renderer *r, Token *t, const Camera *c) {
+    if (t->aura <= 0 || t->hidden) return;
+    
+    // Aura covers the token's cells plus aura radius in each direction
+    int aura_size = t->size + t->aura * 2;  // Token size + aura on both sides
+    int aura_gx = t->grid_x - t->aura;
+    // Account for token extending upward (like render_token does)
+    int aura_gy = t->grid_y - t->aura - (t->size - 1);
+    
+    float ax = (aura_gx * g.grid_size + g.grid_off_x - c->x) * c->zoom;
+    float ay = (aura_gy * g.grid_size + g.grid_off_y - c->y) * c->zoom;
+    float aw = aura_size * g.grid_size * c->zoom;
+    float ah = aura_size * g.grid_size * c->zoom;
+    
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 135, 206, 250, 100);  // Light blue, semi-transparent
+    SDL_RenderFillRect(r, &(SDL_FRect){ax, ay, aw, ah});
+    SDL_SetRenderDrawColor(r, 135, 206, 250, 200);  // Light blue border
+    SDL_RenderRect(r, &(SDL_FRect){ax, ay, aw, ah});
 }
 
 static void render_token_markers(SDL_Renderer *r, Token *t, const Camera *c, int view) {
@@ -647,6 +708,14 @@ static void render_view(int view) {
         }
     }
     PROFILE_END(drawings_render);
+    
+    // Z-Layer: Token auras (under tokens)
+    PROFILE_BEGIN(token_auras_render);
+    for (int i = 0; i < g.token_count; i++) {
+        if (view == 1 && !fog_get(g.tokens[i].grid_x, g.tokens[i].grid_y)) continue;
+        render_token_aura(r, &g.tokens[i], c);
+    }
+    PROFILE_END(token_auras_render);
     
     // Z-Layer: Tokens (without damage/conditions)
     PROFILE_BEGIN(tokens_render);
@@ -849,18 +918,14 @@ static void render_view(int view) {
                 update_cached_text(&g.ui_calibration, r, cal_text, (SDL_Color){255,255,100,255});
             }
             if (g.ui_calibration.tex) {
-                SDL_SetRenderDrawColor(r, 60, 40, 40, 240);
-                SDL_RenderFillRect(r, &(SDL_FRect){10, 10, g.ui_calibration.w + 40, g.ui_calibration.h + 20});
-                SDL_SetRenderDrawColor(r, 200, 150, 100, 255);
-                SDL_RenderRect(r, &(SDL_FRect){10, 10, g.ui_calibration.w + 40, g.ui_calibration.h + 20});
-                SDL_RenderTexture(r, g.ui_calibration.tex, NULL, &(SDL_FRect){20, 20, g.ui_calibration.w, g.ui_calibration.h});
+                draw_ui_panel(r, 10, 10, g.ui_calibration.w + 40, g.ui_calibration.h + 20,
+                              (SDL_Color){60,40,40,240}, (SDL_Color){200,150,100,255}, 
+                              g.ui_calibration.tex, 10, 10);
             }
         } else if (g.ui_tool.tex) {
-            SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
-            SDL_RenderFillRect(r, &(SDL_FRect){10, 10, g.ui_tool.w + 40, g.ui_tool.h + 20});
-            SDL_SetRenderDrawColor(r, 100, 100, 150, 255);
-            SDL_RenderRect(r, &(SDL_FRect){10, 10, g.ui_tool.w + 40, g.ui_tool.h + 20});
-            SDL_RenderTexture(r, g.ui_tool.tex, NULL, &(SDL_FRect){20, 20, g.ui_tool.w, g.ui_tool.h});
+            draw_ui_panel(r, 10, 10, g.ui_tool.w + 40, g.ui_tool.h + 20,
+                          (SDL_Color){40,40,60,240}, (SDL_Color){100,100,150,255}, 
+                          g.ui_tool.tex, 10, 10);
         }
         
         // Show tool-specific info below main tool display
@@ -895,12 +960,9 @@ static void render_view(int view) {
                 
                 update_cached_text(&g.ui_help, r, cond_buf, (SDL_Color){255,255,255,255});
                 if (g.ui_help.tex) {
-                    int y = 50;
-                    SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
-                    SDL_RenderFillRect(r, &(SDL_FRect){10, y, g.ui_help.w + 40, g.ui_help.h + 20});
-                    SDL_SetRenderDrawColor(r, 100, 100, 150, 255);
-                    SDL_RenderRect(r, &(SDL_FRect){10, y, g.ui_help.w + 40, g.ui_help.h + 20});
-                    SDL_RenderTexture(r, g.ui_help.tex, NULL, &(SDL_FRect){20, y+10, g.ui_help.w, g.ui_help.h});
+                    draw_ui_panel(r, 10, 50, g.ui_help.w + 40, g.ui_help.h + 20,
+                                  (SDL_Color){40,40,60,240}, (SDL_Color){100,100,150,255}, 
+                                  g.ui_help.tex, 10, 10);
                 }
             }
         } else if (g.tool == TOOL_FOG) {
@@ -909,12 +971,9 @@ static void render_view(int view) {
             snprintf(buf, 64, "FOG BRUSH: %dx%d cells (+/- to adjust)", g.fog_brush_size, g.fog_brush_size);
             update_cached_text(&g.ui_squad, r, buf, (SDL_Color){255,255,255,255});
             if (g.ui_squad.tex) {
-                int y = 50;
-                SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
-                SDL_RenderFillRect(r, &(SDL_FRect){10, y, g.ui_squad.w + 40, g.ui_squad.h + 20});
-                SDL_SetRenderDrawColor(r, 100, 100, 150, 255);
-                SDL_RenderRect(r, &(SDL_FRect){10, y, g.ui_squad.w + 40, g.ui_squad.h + 20});
-                SDL_RenderTexture(r, g.ui_squad.tex, NULL, &(SDL_FRect){20, y+10, g.ui_squad.w, g.ui_squad.h});
+                draw_ui_panel(r, 10, 50, g.ui_squad.w + 40, g.ui_squad.h + 20,
+                              (SDL_Color){40,40,60,240}, (SDL_Color){100,100,150,255}, 
+                              g.ui_squad.tex, 10, 10);
             }
         } else if (g.tool == TOOL_SQUAD || g.tool == TOOL_DRAW) {
             char buf[64];
@@ -922,19 +981,18 @@ static void render_view(int view) {
             snprintf(buf, 64, "%s: Color %d", type, g.current_squad);
             update_cached_text(&g.ui_squad, r, buf, (SDL_Color){255,255,255,255});
             if (g.ui_squad.tex) {
-                int y = 50;
-                SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
-                SDL_RenderFillRect(r, &(SDL_FRect){10, y, g.ui_squad.w + 60, g.ui_squad.h + 20});
                 static const SDL_Color squad_cols[8] = {
                     {255,50,50,255},{50,150,255,255},{50,255,50,255},{255,255,50,255},
                     {255,150,50,255},{200,50,255,255},{50,255,255,255},{255,255,255,255}
                 };
+                draw_ui_panel(r, 10, 50, g.ui_squad.w + 60, g.ui_squad.h + 20,
+                              (SDL_Color){40,40,60,240}, (SDL_Color){100,100,150,255}, NULL, 0, 0);
                 SDL_Color col = squad_cols[g.current_squad % 8];
                 SDL_SetRenderDrawColor(r, col.r, col.g, col.b, 255);
-                SDL_RenderFillRect(r, &(SDL_FRect){20, y+10, 20, 20});
+                SDL_RenderFillRect(r, &(SDL_FRect){20, 60, 20, 20});
                 SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
-                SDL_RenderRect(r, &(SDL_FRect){20, y+10, 20, 20});
-                SDL_RenderTexture(r, g.ui_squad.tex, NULL, &(SDL_FRect){50, y+10, g.ui_squad.w, g.ui_squad.h});
+                SDL_RenderRect(r, &(SDL_FRect){20, 60, 20, 20});
+                SDL_RenderTexture(r, g.ui_squad.tex, NULL, &(SDL_FRect){50, 60, g.ui_squad.w, g.ui_squad.h});
             }
         }
         
@@ -943,11 +1001,9 @@ static void render_view(int view) {
             update_cached_text(&g.ui_dmg, r, buf, g.shift ? (SDL_Color){100,255,100,255} : (SDL_Color){255,100,100,255});
             if (g.ui_dmg.tex) {
                 int x = win->w/2 - (g.ui_dmg.w + 40)/2;
-                SDL_SetRenderDrawColor(r, 40, 40, 60, 240);
-                SDL_RenderFillRect(r, &(SDL_FRect){x, 20, g.ui_dmg.w + 40, g.ui_dmg.h + 20});
-                SDL_SetRenderDrawColor(r, g.shift ? 100 : 200, g.shift ? 200 : 100, 100, 255);
-                SDL_RenderRect(r, &(SDL_FRect){x, 20, g.ui_dmg.w + 40, g.ui_dmg.h + 20});
-                SDL_RenderTexture(r, g.ui_dmg.tex, NULL, &(SDL_FRect){x+20, 30, g.ui_dmg.w, g.ui_dmg.h});
+                SDL_Color border = g.shift ? (SDL_Color){100,200,100,255} : (SDL_Color){200,100,100,255};
+                draw_ui_panel(r, x, 20, g.ui_dmg.w + 40, g.ui_dmg.h + 20,
+                              (SDL_Color){40,40,60,240}, border, g.ui_dmg.tex, 20, 10);
             }
         }
         
@@ -1172,6 +1228,152 @@ static void handle_input() {
             }
         }
         
+        // Touch input handling (for Steam Deck and tablets)
+        if (e.type == SDL_EVENT_FINGER_DOWN) {
+            // If in ignore mode (from 3+ fingers), stay in ignore mode until all released
+            if (g.touch_ignore_mode) {
+                g.touch_count++;
+                continue;
+            }
+            
+            // Check if we've exceeded 2 fingers - enter ignore mode
+            if (g.touch_count >= 2) {
+                g.touch_ignore_mode = true;
+                g.touch_count++;
+                g.touch_gesture = 0;
+                continue;
+            }
+            
+            // Store new finger
+            int idx = g.touch_count;
+            g.touch_fingers[idx].id = e.tfinger.fingerID;
+            g.touch_fingers[idx].x = g.touch_fingers[idx].start_x = e.tfinger.x * g.dm.w;
+            g.touch_fingers[idx].y = g.touch_fingers[idx].start_y = e.tfinger.y * g.dm.h;
+            g.touch_count++;
+            
+            if (g.touch_count == 2) {
+                // Two fingers down - initialize gesture detection
+                float dx = g.touch_fingers[1].x - g.touch_fingers[0].x;
+                float dy = g.touch_fingers[1].y - g.touch_fingers[0].y;
+                g.touch_start_dist = sqrtf(dx * dx + dy * dy);
+                g.touch_start_zoom = g.cam[0].target_zoom;
+                g.touch_start_center_x = (g.touch_fingers[0].x + g.touch_fingers[1].x) / 2.0f;
+                g.touch_start_center_y = (g.touch_fingers[0].y + g.touch_fingers[1].y) / 2.0f;
+                g.touch_start_cam_x = g.cam[0].target_x;
+                g.touch_start_cam_y = g.cam[0].target_y;
+                g.touch_gesture = 0;  // Will be determined on first motion
+            }
+        }
+        
+        if (e.type == SDL_EVENT_FINGER_UP) {
+            // Find which finger was released
+            int released_idx = -1;
+            for (int i = 0; i < g.touch_count && i < MAX_TOUCH_FINGERS; i++) {
+                if (g.touch_fingers[i].id == e.tfinger.fingerID) {
+                    released_idx = i;
+                    break;
+                }
+            }
+            
+            g.touch_count--;
+            if (g.touch_count < 0) g.touch_count = 0;
+            
+            // Remove the finger from tracking array by shifting
+            if (released_idx >= 0 && released_idx < MAX_TOUCH_FINGERS - 1) {
+                for (int i = released_idx; i < g.touch_count && i < MAX_TOUCH_FINGERS - 1; i++) {
+                    g.touch_fingers[i] = g.touch_fingers[i + 1];
+                }
+            }
+            
+            // Clear ignore mode when all fingers released
+            if (g.touch_count == 0) {
+                g.touch_ignore_mode = false;
+                g.touch_gesture = 0;
+            }
+            
+            // If we drop below 2 fingers, end any active gesture
+            if (g.touch_count < 2) {
+                g.touch_gesture = 0;
+            } else if (g.touch_count == 2 && !g.touch_ignore_mode) {
+                // Re-initialize gesture with remaining fingers
+                float dx = g.touch_fingers[1].x - g.touch_fingers[0].x;
+                float dy = g.touch_fingers[1].y - g.touch_fingers[0].y;
+                g.touch_start_dist = sqrtf(dx * dx + dy * dy);
+                g.touch_start_zoom = g.cam[0].target_zoom;
+                g.touch_start_center_x = (g.touch_fingers[0].x + g.touch_fingers[1].x) / 2.0f;
+                g.touch_start_center_y = (g.touch_fingers[0].y + g.touch_fingers[1].y) / 2.0f;
+                g.touch_start_cam_x = g.cam[0].target_x;
+                g.touch_start_cam_y = g.cam[0].target_y;
+                g.touch_gesture = 0;
+            }
+        }
+        
+        if (e.type == SDL_EVENT_FINGER_MOTION && g.touch_count == 2 && !g.touch_ignore_mode) {
+            // Find which finger moved
+            int moved_idx = -1;
+            for (int i = 0; i < 2; i++) {
+                if (g.touch_fingers[i].id == e.tfinger.fingerID) {
+                    moved_idx = i;
+                    break;
+                }
+            }
+            if (moved_idx < 0) continue;  // Unknown finger
+            
+            // Update finger position
+            g.touch_fingers[moved_idx].x = e.tfinger.x * g.dm.w;
+            g.touch_fingers[moved_idx].y = e.tfinger.y * g.dm.h;
+            
+            // Calculate current state
+            float dx = g.touch_fingers[1].x - g.touch_fingers[0].x;
+            float dy = g.touch_fingers[1].y - g.touch_fingers[0].y;
+            float curr_dist = sqrtf(dx * dx + dy * dy);
+            float curr_center_x = (g.touch_fingers[0].x + g.touch_fingers[1].x) / 2.0f;
+            float curr_center_y = (g.touch_fingers[0].y + g.touch_fingers[1].y) / 2.0f;
+            
+            // Calculate movement from start
+            float dist_delta = fabsf(curr_dist - g.touch_start_dist);
+            float center_delta = sqrtf(powf(curr_center_x - g.touch_start_center_x, 2) + 
+                                       powf(curr_center_y - g.touch_start_center_y, 2));
+            
+            // Gesture classification with hysteresis
+            const float GESTURE_THRESHOLD = 15.0f;  // Pixels of movement to classify
+            const float PINCH_DOMINANCE = 1.5f;     // Distance change must be 1.5x center movement for pinch
+            
+            if (g.touch_gesture == 0) {
+                // Classify the gesture based on movement pattern
+                if (dist_delta > GESTURE_THRESHOLD || center_delta > GESTURE_THRESHOLD) {
+                    if (dist_delta > center_delta * PINCH_DOMINANCE) {
+                        g.touch_gesture = 2;  // PINCH
+                    } else if (center_delta > dist_delta) {
+                        g.touch_gesture = 1;  // PAN
+                    }
+                }
+            }
+            
+            // Apply gesture
+            if (g.touch_gesture == 2) {  // PINCH
+                // Pure zoom - center stays fixed at gesture start point
+                float scale = curr_dist / g.touch_start_dist;
+                float new_zoom = g.touch_start_zoom * scale;
+                if (new_zoom < 0.1f) new_zoom = 0.1f;
+                if (new_zoom > 10.0f) new_zoom = 10.0f;
+                
+                // Zoom toward the gesture center point (not screen center)
+                float wx = g.touch_start_center_x / g.touch_start_zoom + g.touch_start_cam_x;
+                float wy = g.touch_start_center_y / g.touch_start_zoom + g.touch_start_cam_y;
+                g.cam[0].target_zoom = new_zoom;
+                g.cam[0].target_x = wx - g.touch_start_center_x / new_zoom;
+                g.cam[0].target_y = wy - g.touch_start_center_y / new_zoom;
+                
+            } else if (g.touch_gesture == 1) {  // PAN
+                // Pure pan - distance between fingers stays constant
+                float pan_dx = curr_center_x - g.touch_start_center_x;
+                float pan_dy = curr_center_y - g.touch_start_center_y;
+                g.cam[0].target_x = g.touch_start_cam_x - pan_dx / g.touch_start_zoom;
+                g.cam[0].target_y = g.touch_start_cam_y - pan_dy / g.touch_start_zoom;
+            }
+        }
+        
         if (e.type == SDL_EVENT_KEY_DOWN) {
             g.shift = (e.key.mod & SDL_KMOD_SHIFT) != 0;
             g.ctrl = (e.key.mod & SDL_KMOD_CTRL) != 0;
@@ -1192,8 +1394,22 @@ static void handle_input() {
                 }
             }
             
-            if ((g.tool == TOOL_SQUAD || g.tool == TOOL_DRAW) && (k == SDLK_Q || k == SDLK_E)) {
-                g.current_squad = (g.current_squad + (k == SDLK_E ? 1 : -1) + 8) % 8;
+            // Q/E cycles token rank when token selected, else cycles squad color
+            if (k == SDLK_Q || k == SDLK_E) {
+                bool any_selected = false;
+                for (int i = 0; i < g.token_count; i++) {
+                    if (g.tokens[i].selected) { any_selected = true; break; }
+                }
+                if (any_selected) {
+                    int delta = (k == SDLK_E) ? 1 : -1;
+                    for (int i = 0; i < g.token_count; i++) {
+                        if (g.tokens[i].selected) {
+                            g.tokens[i].rank = (g.tokens[i].rank + delta + RANK_COUNT) % RANK_COUNT;
+                        }
+                    }
+                } else if (g.tool == TOOL_SQUAD || g.tool == TOOL_DRAW) {
+                    g.current_squad = (g.current_squad + (k == SDLK_E ? 1 : -1) + 8) % 8;
+                }
             }
             
             if (g.current_shape == SHAPE_RECT && g.tool == TOOL_DRAW && k == SDLK_W) {
@@ -1269,6 +1485,16 @@ static void handle_input() {
             if (k == SDLK_H) {
                 for (int i = 0; i < g.token_count; i++) 
                     if (g.tokens[i].selected) g.tokens[i].hidden = !g.tokens[i].hidden;
+            }
+            
+            // S toggles aura on selected tokens (1 = adjacent cells, grows with +/-)
+            if (k == SDLK_S) {
+                for (int i = 0; i < g.token_count; i++) {
+                    if (g.tokens[i].selected) {
+                        if (g.tokens[i].aura > 0) g.tokens[i].aura = 0;
+                        else g.tokens[i].aura = 1;  // Start with 1 cell radius (3x3 area)
+                    }
+                }
             }
             
             if (k == SDLK_D) {
@@ -1363,6 +1589,8 @@ static void handle_input() {
                             fwrite(&t->size, 4, 1, f);
                             fwrite(&t->damage, 4, 1, f);
                             fwrite(&t->squad, 4, 1, f);
+                            fwrite(&t->rank, 4, 1, f);
+                            fwrite(&t->aura, 4, 1, f);
                             fwrite(&t->opacity, 1, 1, f);
                             fwrite(&t->hidden, 1, 1, f);
                             fwrite(t->cond, 1, COND_COUNT, f);
@@ -1415,6 +1643,8 @@ static void handle_input() {
                                 fread(&t->size, 4, 1, f);
                                 fread(&t->damage, 4, 1, f);
                                 fread(&t->squad, 4, 1, f);
+                                fread(&t->rank, 4, 1, f);
+                                fread(&t->aura, 4, 1, f);
                                 fread(&t->opacity, 1, 1, f);
                                 fread(&t->hidden, 1, 1, f);
                                 fread(t->cond, 1, COND_COUNT, f);
@@ -1519,9 +1749,19 @@ static void handle_input() {
                     // Increase fog brush size
                     if (g.fog_brush_size < 9) g.fog_brush_size += 2; // Keep it odd for symmetry
                 } else {
-                    // Resize selected tokens
-                    for (int i = 0; i < g.token_count; i++) 
-                        if (g.tokens[i].selected && g.tokens[i].size < 4) g.tokens[i].size++;
+                    // Check if any selected token has an aura - grow aura if so
+                    bool has_aura = false;
+                    for (int i = 0; i < g.token_count; i++) {
+                        if (g.tokens[i].selected && g.tokens[i].aura > 0) {
+                            g.tokens[i].aura++;
+                            has_aura = true;
+                        }
+                    }
+                    // Otherwise resize selected tokens
+                    if (!has_aura) {
+                        for (int i = 0; i < g.token_count; i++) 
+                            if (g.tokens[i].selected && g.tokens[i].size < 4) g.tokens[i].size++;
+                    }
                 }
             }
             if ((k == SDLK_MINUS || k == SDLK_KP_MINUS)) {
@@ -1529,9 +1769,19 @@ static void handle_input() {
                     // Decrease fog brush size
                     if (g.fog_brush_size > 1) g.fog_brush_size -= 2; // Keep it odd
                 } else {
-                    // Resize selected tokens
-                    for (int i = 0; i < g.token_count; i++) 
-                        if (g.tokens[i].selected && g.tokens[i].size > 1) g.tokens[i].size--;
+                    // Check if any selected token has an aura - shrink aura if so
+                    bool has_aura = false;
+                    for (int i = 0; i < g.token_count; i++) {
+                        if (g.tokens[i].selected && g.tokens[i].aura > 0) {
+                            has_aura = true;
+                            if (g.tokens[i].aura > 1) g.tokens[i].aura--;
+                        }
+                    }
+                    // Otherwise resize selected tokens
+                    if (!has_aura) {
+                        for (int i = 0; i < g.token_count; i++) 
+                            if (g.tokens[i].selected && g.tokens[i].size > 1) g.tokens[i].size--;
+                    }
                 }
             }
             
@@ -1626,6 +1876,7 @@ static void handle_input() {
                         g.tokens[g.token_count].selected = true;
                         g.tokens[g.token_count].damage_tex[0] = g.tokens[g.token_count].damage_tex[1] = NULL;
                         g.tokens[g.token_count].cached_dmg[0] = g.tokens[g.token_count].cached_dmg[1] = -1;
+                        g.tokens[g.token_count].aura = 0;  // Reset aura on duplicate
                         g.tokens[g.token_count].grid_x = gx;
                         g.tokens[g.token_count].grid_y = gy;
                         g.drag_token = true;
@@ -1752,12 +2003,24 @@ static void handle_input() {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     
-    SDL_Init(SDL_INIT_VIDEO);
+    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
     
     // Initialize profiler
     profiler.freq = SDL_GetPerformanceFrequency();
     profiler.count = 0;
     profiler.show_overlay = false;
+    
+    // Initialize touch input state
+    g.touch_count = 0;
+    g.touch_ignore_mode = false;
+    g.touch_gesture = 0;
+    g.touch_start_dist = 0.0f;
+    g.touch_start_zoom = 1.0f;
+    g.touch_start_center_x = 0.0f;
+    g.touch_start_center_y = 0.0f;
+    g.touch_start_cam_x = 0.0f;
+    g.touch_start_cam_y = 0.0f;
+    memset(g.touch_fingers, 0, sizeof(g.touch_fingers));
     
     g.dm.win = SDL_CreateWindow("DM View", 1280, 720, SDL_WINDOW_RESIZABLE);
     g.player.win = SDL_CreateWindow("Player View", 1280, 720, SDL_WINDOW_RESIZABLE);
@@ -1765,6 +2028,54 @@ int main(int argc, char **argv) {
     g.player.ren = SDL_CreateRenderer(g.player.win, NULL);
     g.dm.id = SDL_GetWindowID(g.dm.win);
     g.player.id = SDL_GetWindowID(g.player.win);
+    
+    // Position player window on secondary monitor if available
+    int num_displays = 0;
+    SDL_DisplayID *displays = SDL_GetDisplays(&num_displays);
+    printf("Number of displays detected: %d\n", num_displays);
+    
+    if (displays && num_displays > 1) {
+        SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+        SDL_DisplayID secondary = 0;
+        SDL_Rect primary_bounds = {0};
+        SDL_GetDisplayBounds(primary, &primary_bounds);
+        printf("Primary display: %d at (%d, %d) %dx%d\n", 
+               (int)primary, primary_bounds.x, primary_bounds.y, primary_bounds.w, primary_bounds.h);
+        
+        // Find the non-primary display
+        for (int i = 0; i < num_displays; i++) {
+            if (displays[i] != primary) {
+                secondary = displays[i];
+                break;
+            }
+        }
+        
+        if (secondary != 0) {
+            SDL_Rect bounds;
+            if (SDL_GetDisplayBounds(secondary, &bounds)) {
+                printf("Secondary display: %d at (%d, %d) %dx%d\n", 
+                       (int)secondary, bounds.x, bounds.y, bounds.w, bounds.h);
+                
+                // If secondary is at same position as primary (overlapping), offset by primary width
+                if (bounds.x == primary_bounds.x && bounds.y == primary_bounds.y) {
+                    bounds.x = primary_bounds.x + primary_bounds.w;
+                    printf("Displays overlap, offsetting to (%d, %d)\n", bounds.x, bounds.y);
+                }
+                
+                SDL_SetWindowPosition(g.player.win, bounds.x, bounds.y);
+                printf("Player window positioned at (%d, %d)\n", bounds.x, bounds.y);
+            }
+        }
+    } else if (displays && num_displays == 1) {
+        // Single display - try to position to the right
+        SDL_Rect bounds;
+        if (SDL_GetDisplayBounds(displays[0], &bounds)) {
+            printf("Single display at (%d, %d) %dx%d, positioning player window to the right\n",
+                   bounds.x, bounds.y, bounds.w, bounds.h);
+            SDL_SetWindowPosition(g.player.win, bounds.x + bounds.w, bounds.y);
+        }
+    }
+    if (displays) SDL_free(displays);
     
     // Load font: try embedded first, then file, then system fonts
     bool font_loaded = false;
@@ -1868,6 +2179,7 @@ int main(int argc, char **argv) {
     printf("  +/- - Fog tool: adjust brush size | Select tool: resize token\n");
     printf("  Right click - Pan camera (drag) / Delete drawing (middle-click in draw mode)\n");
     printf("  Mouse Wheel - Zoom in/out at cursor\n");
+    printf("  Touch: Two-finger pinch - Zoom | Two-finger drag - Pan camera (Steam Deck!)\n");
     printf("  ALT+Click - Start/end measurement tool (shows distance in grid cells)\n");
     printf("  W - Cycle shape (in draw mode)\n");
     printf("  Q/E - Cycle colors (in squad/draw mode)\n");
